@@ -1,0 +1,26 @@
+# Project decision: only commit architecture docs.
+
+# Planning / tracking docs (local-only)
+Implementation.md
+task.md
+progress.md
+
+# ADRs (local-only)
+docs/ADR-*.md
+
+# Python basics (local-only)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
