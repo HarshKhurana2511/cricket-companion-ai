@@ -8,6 +8,42 @@ progress.md
 # ADRs (local-only)
 docs/ADR-*.md
 
+# Local-only folders (standardized)
+data/
+artifacts/
+cache/
+logs/
+
+# Local databases / data files
+*.duckdb
+*.db
+*.sqlite
+*.sqlite3
+
+# Vector store artifacts (FAISS and friends)
+*.faiss
+*.index
+*.bin
+vectorstore/
+
+# Web/cache artifacts
+*.jsonl
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# Secrets
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
 # Python basics (local-only)
 __pycache__/
 *.py[cod]
