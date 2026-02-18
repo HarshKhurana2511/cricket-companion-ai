@@ -26,14 +26,15 @@ flowchart LR
   A3 -->|tools via MCP| MCP3[MCP servers (one tool per server)]
   A4 -->|tools via MCP| MCP4[MCP servers (one tool per server)]
 
-  MCP2 --> D1[Cricket data: DuckDB/Cricsheet]
+  MCP2 --> D1[Cricket data: Cricsheet YAML -> DuckDB]
   MCP1 --> R1[FAISS index (local)]
   MCP2 --> R1
   MCP3 --> R1
   MCP4 --> R1
+  R1 --> S3I[(S3: FAISS artifacts)]
 
-  MCP1 --> W1[Web tools: Tavily/ESPN]
-  W1 --> C1[JSON cache]
+  MCP1 --> W1[Web tools: Tavily + ESPN match/scorecards]
+  W1 --> C1[JSON cache (TTL 7d, 1 retry)]
   C1 --> S3[(S3: cached web data)]
 
   G --> S[Summarizer]
@@ -44,8 +45,14 @@ flowchart LR
 ## Decisions
 - Single UI, single API endpoint; server routes internally.
 - All tools are accessed via MCP; each tool is its own MCP server.
-- Session memory: DuckDB on disk.
-- Retrieval: FAISS on disk; in prod, sync artifacts to S3.
-- Web cache: JSON persisted to S3 with 7-day TTL.
+- Data: Cricsheet YAML-only into a single DuckDB, with incremental updates.
+- Session memory: DuckDB on disk (persisted across restarts).
+- Retrieval: FAISS on disk; in prod, sync artifacts to S3 on startup/shutdown.
+- Web: Tavily used for both general and current queries; ESPN ingestion focuses on match/scorecard pages (no full articles).
+- Web cache: JSON persisted to S3 with 7-day TTL; tool calls retry once and then fall back to cached results.
+- Citations: web-derived outputs return source URLs and fetched timestamps.
 - AWS: minimal for now (ECS/Fargate single container + S3).
 
+## Containerization
+- Local: docker-compose can run `api`, `ui`, and one MCP server per tool as separate services (optional; `uv` local runs are fine too).
+- Prod: a single ECS/Fargate container runs API/UI + MCP servers as multiple processes (keep it simple).
