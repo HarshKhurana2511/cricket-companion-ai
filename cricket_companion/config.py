@@ -89,6 +89,10 @@ class Settings:
     timeout_sim_s: int
     timeout_fantasy_s: int
 
+    router_mode: str
+    router_heuristic_min_score: int
+    router_heuristic_margin: int
+
     @property
     def is_prod(self) -> bool:
         return self.env.lower() in {"prod", "production"}
@@ -117,6 +121,10 @@ def get_settings(*, load_env_file: bool = True) -> Settings:
     cache_dir = _getenv_path("CACHE_DIR", Path("cache"))
     logs_dir = _getenv_path("LOGS_DIR", Path("logs"))
 
+    router_mode = (_getenv("ROUTER_MODE", "real") or "real").strip().lower()
+    default_min_score = 3 if router_mode == "easy" else 5
+    default_margin = 0 if router_mode == "easy" else 3
+
     return Settings(
         env=env,
         model=_getenv("MODEL", "gpt-4o-mini") or "gpt-4o-mini",
@@ -134,5 +142,8 @@ def get_settings(*, load_env_file: bool = True) -> Settings:
         timeout_web_s=_getenv_int("TIMEOUT_WEB_S", 30),
         timeout_sim_s=_getenv_int("TIMEOUT_SIM_S", 20),
         timeout_fantasy_s=_getenv_int("TIMEOUT_FANTASY_S", 20),
-    )
 
+        router_mode=router_mode,
+        router_heuristic_min_score=_getenv_int("ROUTER_MIN_SCORE", default_min_score),
+        router_heuristic_margin=_getenv_int("ROUTER_MARGIN", default_margin),
+    )

@@ -28,6 +28,15 @@ class _HeuristicSignal:
 
 _SIGNALS: list[_HeuristicSignal] = [
     _HeuristicSignal(
+        route="basic",
+        weight=3,
+        label="basic_keywords",
+        pattern=re.compile(
+            r"\b(explain|define|meaning|rules|difference|what\s+is|what's|whats|when\s+is|how\s+do)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    _HeuristicSignal(
         route="fantasy",
         weight=5,
         label="fantasy_keywords",
@@ -70,7 +79,7 @@ def _score_with_heuristics(text: str) -> tuple[dict[Route, int], list[str]]:
     return scores, hits
 
 
-def _high_confidence(scores: dict[Route, int]) -> tuple[bool, Route]:
+def _high_confidence(scores: dict[Route, int], *, min_score: int, margin: int) -> tuple[bool, Route]:
     ordered = sorted(
         ((route, score) for route, score in scores.items() if route != "unknown"),
         key=lambda x: x[1],
@@ -79,10 +88,10 @@ def _high_confidence(scores: dict[Route, int]) -> tuple[bool, Route]:
     best_route, best = ordered[0]
     second = ordered[1][1]
 
-    # "High confidence" is intentionally conservative:
-    # - the best score must be meaningfully high
-    # - and must beat the next best by a margin
-    return (best >= 5 and (best - second) >= 3), best_route
+    # High confidence is configurable:
+    # - `min_score` ensures at least one strong match
+    # - `margin` ensures it beats the next best by a gap (set to 0 for "easy" mode)
+    return (best >= min_score and (best - second) >= margin), best_route
 
 
 def _clarify_from_scores(scores: dict[Route, int]) -> str:
@@ -106,10 +115,10 @@ def _clarify_from_scores(scores: dict[Route, int]) -> str:
     return "Can you clarify what you want to do (basic explanation vs stats analysis vs scenario simulation vs fantasy XI)?"
 
 
-def heuristic_route(state: ChatState) -> RouteDecision:
+def heuristic_route(state: ChatState, *, min_score: int, margin: int) -> RouteDecision:
     text = state.user_message.content
     scores, hits = _score_with_heuristics(text)
-    confident, best_route = _high_confidence(scores)
+    confident, best_route = _high_confidence(scores, min_score=min_score, margin=margin)
 
     if confident:
         confidence = min(1.0, scores[best_route] / 8.0)
@@ -226,14 +235,18 @@ def route_intent(state: ChatState, *, settings: Settings | None = None) -> ChatS
     - If heuristics confidence is high, route immediately.
     - Else ask the LLM to classify.
     """
-    decision = heuristic_route(state)
+    effective_settings = settings or get_settings()
+    decision = heuristic_route(
+        state,
+        min_score=effective_settings.router_heuristic_min_score,
+        margin=effective_settings.router_heuristic_margin,
+    )
     if decision.route != "unknown":
         state.route = decision.route
         state.route_reason = decision.reason
         state.clarifying_question = None
         return state
 
-    effective_settings = settings or get_settings()
     llm_decision = llm_route(state, effective_settings)
     state.route = llm_decision.route
     # Keep heuristic scoring visible even when we fall back to LLM.

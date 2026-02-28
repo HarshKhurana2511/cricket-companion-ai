@@ -49,6 +49,7 @@ def build_graph():
 
     from cricket_companion.chat_models import ChatState
     from cricket_companion.output_models import AssistantOutput
+    from cricket_companion.executor import execute_tool_plan
     from cricket_companion.planner import plan_tools
     from cricket_companion.router import route_intent
 
@@ -63,6 +64,11 @@ def build_graph():
         data = s.model_dump()
         data["tool_plan"] = plan.model_dump()
         return data
+
+    def execute_tools_node(state: GraphState) -> GraphState:
+        s = ChatState.model_validate(state)
+        s = execute_tool_plan(s)
+        return s.model_dump()
 
     def respond_node(state: GraphState) -> GraphState:
         s = ChatState.model_validate(state)
@@ -95,11 +101,13 @@ def build_graph():
     graph = StateGraph(GraphState)
     graph.add_node("route", route_node)
     graph.add_node("plan", plan_node)
+    graph.add_node("execute_tools", execute_tools_node)
     graph.add_node("respond", respond_node)
 
     graph.set_entry_point("route")
     graph.add_edge("route", "plan")
-    graph.add_edge("plan", "respond")
+    graph.add_edge("plan", "execute_tools")
+    graph.add_edge("execute_tools", "respond")
     graph.add_edge("respond", END)
 
     return graph.compile()
