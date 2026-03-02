@@ -78,6 +78,65 @@ def build_graph():
         if s.route == "unknown":
             answer = s.clarifying_question or "Can you clarify what you want?"
             output = AssistantOutput(answer_text=answer, citations=[], tables=[], charts=[])
+        elif s.route == "analyst":
+            from cricket_companion.analyst_response import build_analyst_output
+
+            stats_trace = next((t for t in reversed(s.tool_traces) if t.tool_name == "stats"), None)
+            if stats_trace is None:
+                output = AssistantOutput(
+                    answer_text="I couldn't run the stats tool for this question. Please try again.",
+                    citations=[],
+                    tables=[],
+                    charts=[],
+                    warnings=["Missing stats tool trace."],
+                )
+            elif stats_trace.error is not None:
+                output = AssistantOutput(
+                    answer_text=f"Stats tool error: {stats_trace.error.code}: {stats_trace.error.message}",
+                    citations=[],
+                    tables=[],
+                    charts=[],
+                    warnings=["Stats tool execution failed before a SQL result was produced."],
+                )
+            else:
+                resp = stats_trace.response if isinstance(stats_trace.response, dict) else None
+                ok = bool(resp.get("ok")) if resp is not None else False
+                if not ok:
+                    err = (resp or {}).get("error") or {}
+                    code = err.get("code") or "UNKNOWN"
+                    msg = err.get("message") or "Stats query failed."
+                    details = err.get("details") or {}
+                    clarifying = details.get("clarifying_question") if isinstance(details, dict) else None
+
+                    answer = clarifying or f"Couldn't compute stats ({code}): {msg}"
+                    output = AssistantOutput(
+                        answer_text=answer,
+                        citations=[],
+                        tables=[],
+                        charts=[],
+                        warnings=["No stats claims were made because the SQL tool did not return ok=true."],
+                        assumptions=["Dataset is IPL men (Cricsheet) only."],
+                    )
+                elif not s.tables:
+                    output = AssistantOutput(
+                        answer_text="Stats query succeeded but returned no table output to ground an answer.",
+                        citations=[],
+                        tables=[],
+                        charts=[],
+                        warnings=["No stats claims were made because there was no SQL table output."],
+                        assumptions=["Dataset is IPL men (Cricsheet) only."],
+                    )
+                else:
+                    output = build_analyst_output(
+                        table=s.tables[0],
+                        citations=s.citations,
+                        warnings=[],
+                        assumptions=[
+                            "Dataset is IPL men (Cricsheet) only.",
+                            "Economy/run rates use legal balls (wides/no-balls excluded from ball counts).",
+                            "Bowler wickets exclude non-bowler dismissals (e.g., run outs) where applicable.",
+                        ],
+                    )
         else:
             call_lines = []
             for call in calls:
@@ -87,9 +146,9 @@ def build_graph():
                 f"Route: {s.route}\n"
                 f"Reason: {s.route_reason or '(none)'}\n\n"
                 f"Planned tool calls:\n{planned}\n\n"
-                "Next: tool execution + summarizer will be added in later tasks."
+                "Next: richer grounded response composition will be added in later tasks."
             )
-            output = AssistantOutput(answer_text=answer, citations=[], tables=[], charts=[])
+            output = AssistantOutput(answer_text=answer, citations=s.citations, tables=s.tables, charts=s.charts)
 
         s.final_answer = output.answer_text
         s.assistant_output = output
