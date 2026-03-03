@@ -78,6 +78,42 @@ def build_graph():
         if s.route == "unknown":
             answer = s.clarifying_question or "Can you clarify what you want?"
             output = AssistantOutput(answer_text=answer, citations=[], tables=[], charts=[])
+        elif s.route == "basic":
+            from cricket_companion.basic_response import build_basic_output
+
+            retrieval_trace = next((t for t in reversed(s.tool_traces) if t.tool_name == "retrieval"), None)
+            if retrieval_trace is None:
+                output = AssistantOutput(
+                    answer_text="I couldn't run retrieval for this question. Please try again.",
+                    citations=[],
+                    tables=[],
+                    charts=[],
+                    warnings=["Missing retrieval tool trace."],
+                )
+            elif retrieval_trace.error is not None:
+                output = AssistantOutput(
+                    answer_text=f"Retrieval tool error: {retrieval_trace.error.code}: {retrieval_trace.error.message}",
+                    citations=[],
+                    tables=[],
+                    charts=[],
+                    warnings=["Retrieval tool execution failed before returning hits."],
+                )
+            else:
+                resp = retrieval_trace.response if isinstance(retrieval_trace.response, dict) else None
+                ok = bool(resp.get("ok")) if resp is not None else False
+                if not ok:
+                    err = (resp or {}).get("error") or {}
+                    code = err.get("code") or "UNKNOWN"
+                    msg = err.get("message") or "Retrieval failed."
+                    output = AssistantOutput(
+                        answer_text=f"Couldn't retrieve supporting docs ({code}): {msg}",
+                        citations=[],
+                        tables=[],
+                        charts=[],
+                        warnings=["No basic answer was composed because retrieval returned ok=false."],
+                    )
+                else:
+                    output = build_basic_output(question=s.user_message.content, retrieval_tool_response=resp or {})
         elif s.route == "analyst":
             from cricket_companion.analyst_response import build_analyst_output
 

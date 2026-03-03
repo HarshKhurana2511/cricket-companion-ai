@@ -134,7 +134,7 @@ def plan_tools(state: ChatState, *, settings: Settings | None = None) -> ToolPla
             PlannedToolCall(
                 tool_name="retrieval",
                 args={"query": query, "top_k": 5},
-                timeout_s=effective_settings.timeout_stats_s,
+                timeout_s=effective_settings.timeout_retrieval_s,
                 use_cache=True,
                 note="RAG over curated cricket knowledge",
             )

@@ -20,14 +20,14 @@ class RetrievalMcpClient:
         self._rpc.close()
 
     def list_tools(self) -> dict[str, Any]:
-        return self._rpc.call("tools/list", {}, timeout_s=self._settings.timeout_stats_s)
+        return self._rpc.call("tools/list", {}, timeout_s=self._settings.timeout_retrieval_s)
 
     def retrieve(self, *, query: str, top_k: int = 5) -> ToolResponse[Any]:
         try:
             result = self._rpc.call(
                 "tools/call",
                 {"name": "retrieve", "arguments": {"query": query, "top_k": top_k}},
-                timeout_s=self._settings.timeout_stats_s,
+                timeout_s=self._settings.timeout_retrieval_s,
             )
         except TimeoutError as exc:
             return ToolResponse.failure(ErrorCode.TIMEOUT, str(exc), meta=ToolMeta())
@@ -39,4 +39,3 @@ class RetrievalMcpClient:
             return ToolResponse[Any].model_validate_json(content)
         except Exception as exc:
             return ToolResponse.failure(ErrorCode.INTERNAL, f"Failed to parse tool response: {exc}", meta=ToolMeta())
-

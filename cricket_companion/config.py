@@ -85,6 +85,7 @@ class Settings:
     logs_dir: Path
 
     timeout_stats_s: int
+    timeout_retrieval_s: int
     timeout_web_s: int
     timeout_sim_s: int
     timeout_fantasy_s: int
@@ -139,6 +140,7 @@ def get_settings(*, load_env_file: bool = True) -> Settings:
         cache_dir=cache_dir,
         logs_dir=logs_dir,
         timeout_stats_s=_getenv_int("TIMEOUT_STATS_S", 10),
+        timeout_retrieval_s=_getenv_int("TIMEOUT_RETRIEVAL_S", 120),
         timeout_web_s=_getenv_int("TIMEOUT_WEB_S", 30),
         timeout_sim_s=_getenv_int("TIMEOUT_SIM_S", 20),
         timeout_fantasy_s=_getenv_int("TIMEOUT_FANTASY_S", 20),

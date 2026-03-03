@@ -37,6 +37,15 @@ _SIGNALS: list[_HeuristicSignal] = [
         ),
     ),
     _HeuristicSignal(
+        route="basic",
+        weight=6,
+        label="basic_define_metric",
+        pattern=re.compile(
+            r"\b(what\s+is|define|meaning\s+of|explain)\s+(batting\s+)?(average|strike\s*rate|economy|run\s*rate|nrr|net\s*run\s*rate)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    _HeuristicSignal(
         route="fantasy",
         weight=5,
         label="fantasy_keywords",

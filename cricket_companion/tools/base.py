@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -41,6 +42,12 @@ class StdioJsonRpcClient:
         if self._proc is not None:
             return
 
+        env = os.environ.copy()
+        # Ensure all MCP child processes emit UTF-8 on stdout so our JSON-RPC reader can decode reliably on Windows.
+        # Some libraries print non-ASCII characters using the system code page otherwise.
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+
         self._proc = subprocess.Popen(
             self._cmd,
             stdin=subprocess.PIPE,
@@ -48,7 +55,9 @@ class StdioJsonRpcClient:
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            errors="replace",
             bufsize=1,
+            env=env,
         )
         self._reader = threading.Thread(target=self._read_loop, name="jsonrpc-stdio-reader", daemon=True)
         self._reader.start()
@@ -117,7 +126,6 @@ class StdioJsonRpcClient:
             if q is not None:
                 q.put(resp)
 
-# eg: [<path-to-venv-python>, "D:\\agentic-ai-cricket\\mcp_servers\\stats_mcp\\server.py"]
+
 def python_cmd_for_script(script_path: str) -> list[str]:
     return [sys.executable, script_path]
-
