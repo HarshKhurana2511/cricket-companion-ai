@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from typing import Any, Iterator, Tuple
 from uuid import uuid4
@@ -15,7 +16,8 @@ def _utc_now_iso() -> str:
 
 
 def _init_state() -> None:
-    st.session_state.setdefault("api_base_url", "http://127.0.0.1:8000")
+    api_base_default = os.environ.get("CC_API_BASE_URL") or "http://127.0.0.1:8000"
+    st.session_state.setdefault("api_base_url", api_base_default)
     st.session_state.setdefault("user_id", "local-user")
     st.session_state.setdefault("session_id", f"ui-session-{uuid4()}")
     # Each message: {role, content, ts, request_id, result?, debug_events?}

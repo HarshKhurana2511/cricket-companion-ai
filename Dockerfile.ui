@@ -1,0 +1,26 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Install uv (used for reproducible dependency sync + running commands)
+RUN pip install --no-cache-dir uv
+
+# Copy dependency metadata first for better Docker layer caching.
+COPY pyproject.toml uv.lock ./
+
+# Create the project venv and install locked deps (skip installing the local project).
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Copy only the UI code (it talks to the API over HTTP).
+COPY ui ./ui
+
+EXPOSE 8501
+
+# Run Streamlit from the built venv directly. Using `uv run` at runtime can
+# trigger a project editable-build (which would fail because we don't copy the
+# full package source into this UI-only image).
+ENV PATH="/app/.venv/bin:${PATH}"
+CMD ["streamlit", "run", "ui/app.py", "--server.address=0.0.0.0", "--server.port=8501"]

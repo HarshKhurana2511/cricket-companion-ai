@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+*.pyc
+
+# Local data/artifacts should be mounted at runtime, not baked into the image.
+data
+artifacts
+*.duckdb
+*.zip
+

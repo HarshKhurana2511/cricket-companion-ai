@@ -1,0 +1,26 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Install uv (used for reproducible dependency sync + running commands)
+RUN pip install --no-cache-dir uv
+
+# Copy dependency metadata first for better Docker layer caching.
+COPY pyproject.toml uv.lock ./
+
+# Create the project venv and install locked deps.
+# Note: we don't install the local project into the venv during build, because
+# the source code is copied in a later Docker layer (better caching).
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Copy application code.
+COPY cricket_companion ./cricket_companion
+COPY api ./api
+COPY mcp_servers ./mcp_servers
+
+EXPOSE 8000
+
+CMD ["uv", "run", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

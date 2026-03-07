@@ -1,0 +1,57 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: cricket-companion-api:local
+    container_name: cricket-companion-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # Pass through host env if present (recommended) rather than relying on .env formatting.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Data + DuckDB live on a mounted volume.
+      CC_CRICKET_DB_PATH: /app/data/duckdb/cricket_ipl_men.duckdb
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request, json; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2); d=json.loads(r.read().decode('utf-8')); raise SystemExit(0 if d.get('status')=='ok' else 1)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    image: cricket-companion-ui:local
+    container_name: cricket-companion-ui
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      # UI calls the API by compose service name on the shared network.
+      CC_API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501', timeout=2).read(); raise SystemExit(0)",
+        ]
+      interval: 15s
+      timeout: 4s
+      retries: 12
+      start_period: 20s
