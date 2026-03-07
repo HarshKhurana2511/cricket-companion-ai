@@ -9,6 +9,10 @@ from cricket_companion.output_models import TableArtifact
 from cricket_companion.planner import PlannedToolCall, ToolPlan
 from cricket_companion.schemas import Citation, ErrorCode, ToolError
 from cricket_companion.tools import RetrievalMcpClient, StatsMcpClient
+from cricket_companion.logging_config import get_logger
+
+
+log = get_logger("executor")
 
 
 def _utc_now() -> datetime:
@@ -55,6 +59,14 @@ def execute_tool_plan_iter(state: ChatState) -> Any:
                         "started_at": started_at.isoformat(),
                     },
                 }
+                log.info(
+                    "tool.call_start",
+                    extra={
+                        "tool_name": call.tool_name,
+                        "request_id": state.request_id,
+                        "session_id": state.session_id,
+                    },
+                )
 
                 response_any: Any = None
                 tool_error: ToolError | None = None
@@ -141,6 +153,17 @@ def execute_tool_plan_iter(state: ChatState) -> Any:
                         "ended_at": ended_at.isoformat(),
                     },
                 }
+                log.info(
+                    "tool.call_end",
+                    extra={
+                        "tool_name": call.tool_name,
+                        "ok": ok,
+                        "elapsed_ms": elapsed_ms,
+                        "error_code": tool_error.code if tool_error else None,
+                        "request_id": state.request_id,
+                        "session_id": state.session_id,
+                    },
+                )
         finally:
             if stats_client is not None:
                 stats_client.close()

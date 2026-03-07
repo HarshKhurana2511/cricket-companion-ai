@@ -6,9 +6,13 @@ from typing import Any
 
 from cricket_companion.chat_models import ChatRequest, ChatResponse, ChatState, Message
 from cricket_companion.config import Settings, get_settings
+from cricket_companion.logging_config import get_logger, set_log_context
 from cricket_companion.memory_store import MemoryStore
 from cricket_companion.llm_composer import extract_numbers
 from cricket_companion.llm_composer import stream_compose_answer_with_llm
+
+
+log = get_logger("chat_service")
 
 
 def _parse_pref_value(raw: str) -> Any:
@@ -180,6 +184,15 @@ def handle_chat(request: ChatRequest, *, settings: Settings | None = None) -> Ch
     con = store.connect()
     try:
         user_id = request.user_id or "local-user"
+        set_log_context(request_id=request.request_id, session_id=request.session_id, user_id=user_id)
+        log.info(
+            "chat.turn_start",
+            extra={
+                "message_id": request.message.message_id,
+                "max_context_messages": request.max_context_messages,
+                "debug": request.debug,
+            },
+        )
 
         mem_resp = _handle_mem_command(
             store,
@@ -270,6 +283,16 @@ def handle_chat(request: ChatRequest, *, settings: Settings | None = None) -> Ch
 
         graph = build_graph()
         result = graph.invoke(state.model_dump())
+        log.info(
+            "chat.turn_graph_completed",
+            extra={
+                "route": result.get("route") or "unknown",
+                "tool_calls": len(((result.get("tool_plan") or {}) or {}).get("calls") or []),
+                "tool_traces": len(result.get("tool_traces") or []),
+                "tables": len(result.get("tables") or []),
+                "citations": len(result.get("citations") or []),
+            },
+        )
 
         assistant_text = str(result.get("final_answer") or "").strip() or "(no answer)"
         assistant_message = Message(role="assistant", content=assistant_text)
@@ -330,6 +353,15 @@ def stream_chat(request: ChatRequest, *, settings: Settings | None = None) -> An
 
     try:
         user_id = request.user_id or "local-user"
+        set_log_context(request_id=request.request_id, session_id=request.session_id, user_id=user_id)
+        log.info(
+            "chat.stream_turn_start",
+            extra={
+                "message_id": request.message.message_id,
+                "max_context_messages": request.max_context_messages,
+                "debug": request.debug,
+            },
+        )
 
         # Handle governance and prefs deterministically (single-chunk stream).
         mem_resp = _handle_mem_command(
@@ -416,10 +448,12 @@ def stream_chat(request: ChatRequest, *, settings: Settings | None = None) -> An
                 "clarifying_question": state.clarifying_question,
             },
         )
+        log.info("router.decision", extra={"route": state.route, "has_clarifying": bool(state.clarifying_question)})
 
         plan = plan_tools(state, settings=effective_settings)
         state.tool_plan = plan.model_dump(mode="json")
         yield emit("plan", {"tool_plan": state.tool_plan})
+        log.info("planner.plan_created", extra={"tool_calls": len(plan.calls)})
 
         for evt in execute_tool_plan_iter(state):
             if isinstance(evt, dict) and "event" in evt and "data" in evt:
@@ -490,7 +524,17 @@ def stream_chat(request: ChatRequest, *, settings: Settings | None = None) -> An
         )
         yield emit("result", resp.model_dump(mode="json"))
         yield emit("done", {"ok": True})
+        log.info(
+            "chat.stream_turn_completed",
+            extra={
+                "route": state.route,
+                "tool_traces": len(state.tool_traces),
+                "tables": len(output.tables),
+                "citations": len(output.citations),
+            },
+        )
     except Exception as exc:
+        log.exception("chat.stream_turn_failed")
         yield emit("error", {"message": str(exc)})
         yield emit("done", {"ok": False})
     finally:
