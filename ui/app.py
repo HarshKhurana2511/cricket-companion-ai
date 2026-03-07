@@ -1,0 +1,366 @@
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from typing import Any, Iterator, Tuple
+from uuid import uuid4
+
+import httpx
+import pandas as pd
+import streamlit as st
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _init_state() -> None:
+    st.session_state.setdefault("api_base_url", "http://127.0.0.1:8000")
+    st.session_state.setdefault("user_id", "local-user")
+    st.session_state.setdefault("session_id", f"ui-session-{uuid4()}")
+    # Each message: {role, content, ts, request_id, result?, debug_events?}
+    st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("selected_request_id", None)
+    st.session_state.setdefault("show_details", False)
+    st.session_state.setdefault("debug", True)
+
+
+def _sse_events(
+    *,
+    url: str,
+    payload: dict[str, Any],
+    timeout_s: float = 300.0,
+) -> Iterator[Tuple[str, dict[str, Any]]]:
+    """
+    Parse SSE stream from the API.
+
+    Yields (event_name, data_dict).
+    """
+    event_name: str | None = None
+    data_lines: list[str] = []
+
+    with httpx.Client(timeout=timeout_s) as client:
+        with client.stream("POST", url, json=payload, headers={"Accept": "text/event-stream"}) as r:
+            r.raise_for_status()
+            for raw in r.iter_lines():
+                line = (raw or "").strip()
+
+                # Event boundary.
+                if line == "":
+                    if event_name is not None:
+                        data_raw = "\n".join(data_lines).strip()
+                        try:
+                            data = json.loads(data_raw) if data_raw else {}
+                        except Exception:
+                            data = {"_raw": data_raw}
+                        yield (event_name, data)
+                    event_name = None
+                    data_lines = []
+                    continue
+
+                if line.startswith("event:"):
+                    event_name = line.split(":", 1)[1].strip()
+                    continue
+
+                if line.startswith("data:"):
+                    data_lines.append(line.split(":", 1)[1].lstrip())
+                    continue
+
+
+def _append_message(
+    role: str,
+    content: str,
+    request_id: str,
+    *,
+    result: dict[str, Any] | None = None,
+    debug_events: list[dict[str, Any]] | None = None,
+) -> None:
+    msg: dict[str, Any] = {"role": role, "content": content, "ts": _utc_now_iso(), "request_id": request_id}
+    if isinstance(result, dict):
+        msg["result"] = result
+    if isinstance(debug_events, list):
+        msg["debug_events"] = debug_events
+    st.session_state["messages"].append(msg)
+
+
+def _render_chat() -> None:
+    messages = st.session_state.get("messages") or []
+    for i, m in enumerate(messages):
+        role = str(m.get("role") or "assistant")
+        with st.chat_message(role):
+            if role == "assistant":
+                col_text, col_btn = st.columns([0.86, 0.14], gap="small")
+                with col_text:
+                    st.markdown(str(m.get("content") or ""))
+                with col_btn:
+                    if st.button("Details", key=f"details_{i}", use_container_width=True):
+                        st.session_state["selected_request_id"] = m.get("request_id")
+                        st.session_state["show_details"] = True
+            else:
+                st.markdown(str(m.get("content") or ""))
+
+
+def _tables_by_id(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for t in result.get("tables") or []:
+        if isinstance(t, dict) and t.get("table_id"):
+            out[str(t["table_id"])] = t
+    return out
+
+
+def _selected_assistant_message() -> dict[str, Any] | None:
+    req = st.session_state.get("selected_request_id")
+    if not req:
+        return None
+    for m in reversed(st.session_state.get("messages") or []):
+        if m.get("role") == "assistant" and m.get("request_id") == req:
+            return m
+    return None
+
+
+def _render_details_panel() -> None:
+    if not st.session_state.get("show_details"):
+        st.info("Click Details on an assistant message to view results and debug info.")
+        return
+
+    m = _selected_assistant_message()
+    if not m:
+        st.warning("No assistant message selected.")
+        return
+
+    col_title, col_close = st.columns([0.7, 0.3], gap="small")
+    with col_title:
+        st.subheader("Details")
+        st.caption(f"request_id: `{m.get('request_id')}`")
+    with col_close:
+        if st.button("Close", use_container_width=True):
+            st.session_state["show_details"] = False
+            st.session_state["selected_request_id"] = None
+            st.rerun()
+
+    result = m.get("result") if isinstance(m.get("result"), dict) else None
+    debug_events = m.get("debug_events") if isinstance(m.get("debug_events"), list) else []
+
+    tabs = st.tabs(["Results", "Debug", "Raw JSON"])
+
+    with tabs[0]:
+        if not isinstance(result, dict):
+            st.info("No result payload captured for this message.")
+        else:
+            subtabs = st.tabs(["Tables", "Charts", "Citations"])
+            tables_index = _tables_by_id(result)
+
+            with subtabs[0]:
+                tables = result.get("tables") or []
+                if not tables:
+                    st.write("No tables.")
+                for t in tables:
+                    if not isinstance(t, dict):
+                        continue
+                    st.subheader(str(t.get("name") or "table"))
+                    rows = t.get("rows") or []
+                    cols = [c.get("name") for c in (t.get("columns") or []) if isinstance(c, dict)]
+                    df = pd.DataFrame(rows)
+                    if cols:
+                        keep = [c for c in cols if c in df.columns]
+                        if keep:
+                            df = df[keep]
+                    st.dataframe(df, use_container_width=True, height=320)
+
+            with subtabs[1]:
+                charts = result.get("charts") or []
+                if not charts:
+                    st.write("No charts.")
+                for ch in charts:
+                    if not isinstance(ch, dict):
+                        continue
+                    st.subheader(str(ch.get("title") or "chart"))
+                    chart_type = ch.get("chart_type")
+                    table_id = ch.get("table_id")
+                    x = ch.get("x")
+                    y = ch.get("y") or []
+
+                    table = tables_index.get(str(table_id)) if table_id else None
+                    if not table:
+                        st.warning("Missing source table for chart.")
+                        continue
+
+                    df = pd.DataFrame(table.get("rows") or [])
+                    if x not in df.columns:
+                        st.warning("Chart x column not found in table.")
+                        continue
+
+                    y_cols = [c for c in y if c in df.columns]
+                    if not y_cols:
+                        st.warning("Chart y columns not found in table.")
+                        continue
+
+                    df2 = df[[x] + y_cols].copy()
+                    df2 = df2.set_index(x)
+
+                    if chart_type == "bar":
+                        st.bar_chart(df2, use_container_width=True)
+                    elif chart_type == "line":
+                        st.line_chart(df2, use_container_width=True)
+                    elif chart_type == "scatter":
+                        st.scatter_chart(df[[x, y_cols[0]]], x=x, y=y_cols[0], use_container_width=True)
+                    elif chart_type == "hist":
+                        st.write("Histogram rendering is minimal; showing bar counts for first y column.")
+                        s = pd.to_numeric(df[y_cols[0]], errors="coerce").dropna()
+                        bins = pd.cut(s, bins=10).value_counts().sort_index()
+                        st.bar_chart(bins, use_container_width=True)
+                    else:
+                        st.write("Unknown chart_type:", chart_type)
+                        st.dataframe(df2, use_container_width=True, height=240)
+
+            with subtabs[2]:
+                citations = result.get("citations") or []
+                if not citations:
+                    st.write("No citations.")
+                for c in citations:
+                    if not isinstance(c, dict):
+                        continue
+                    title = c.get("title") or c.get("url")
+                    st.markdown(
+                        f"- **{title}**  \n  `{c.get('url')}`  \n  fetched_at: `{c.get('fetched_at')}`"
+                    )
+
+    with tabs[1]:
+        if not debug_events:
+            st.info("No debug events captured.")
+        else:
+            for e in debug_events[-200:]:
+                ev = str(e.get("event") or "")
+                ts = str(e.get("ts") or "")
+                with st.expander(f"{ts}  {ev}", expanded=False):
+                    st.json(e.get("data") or {}, expanded=False)
+
+    with tabs[2]:
+        st.json({"message": m, "result": result, "debug_events": debug_events}, expanded=False)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Cricket Companion", layout="wide")
+    _init_state()
+
+    st.title("Cricket Companion")
+
+    st.markdown(
+        """
+        <style>
+        /* Keep chat input near the bottom while scrolling. */
+        div[data-testid="stChatInput"] {
+          position: sticky;
+          bottom: 0;
+          background: var(--background-color);
+          padding-top: 0.5rem;
+          padding-bottom: 0.5rem;
+          z-index: 2;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.subheader("Connection")
+        st.session_state["api_base_url"] = st.text_input(
+            "API base URL",
+            value=st.session_state["api_base_url"],
+        )
+        st.session_state["user_id"] = st.text_input("user_id", value=st.session_state["user_id"])
+        st.session_state["session_id"] = st.text_input("session_id", value=st.session_state["session_id"])
+        st.session_state["debug"] = st.toggle("debug", value=bool(st.session_state["debug"]))
+
+        if st.button("Reset UI session"):
+            st.session_state["session_id"] = f"ui-session-{uuid4()}"
+            st.session_state["messages"] = []
+            st.session_state["selected_request_id"] = None
+            st.session_state["show_details"] = False
+            st.rerun()
+
+        st.caption("Tip: you can send `/pref ...` and `/mem ...` commands in chat.")
+
+    col_chat, col_details = st.columns([3, 1], gap="large")
+
+    with col_chat:
+        st.subheader("Chat")
+        _render_chat()
+        user_text = st.chat_input("Ask a cricket question...")
+
+    with col_details:
+        _render_details_panel()
+
+    if not user_text:
+        return
+
+    request_id = f"ui-req-{uuid4()}"
+    msg_id = f"ui-msg-{uuid4()}"
+
+    _append_message("user", user_text, request_id=request_id)
+
+    # Assistant placeholder for streaming.
+    assistant_placeholder = None
+    with col_chat:
+        with st.chat_message("assistant"):
+            assistant_placeholder = st.empty()
+
+    stream_url = st.session_state["api_base_url"].rstrip("/") + "/chat/stream"
+
+    payload = {
+        "session_id": st.session_state["session_id"],
+        "request_id": request_id,
+        "user_id": st.session_state["user_id"],
+        "message": {
+            "message_id": msg_id,
+            "role": "user",
+            "content": user_text,
+            "created_at": _utc_now_iso(),
+            "metadata": {},
+        },
+        "debug": bool(st.session_state["debug"]),
+        "max_context_messages": 30,
+    }
+
+    assembled = ""
+    debug_events: list[dict[str, Any]] = []
+    result_payload: dict[str, Any] | None = None
+    try:
+        for event, data in _sse_events(url=stream_url, payload=payload):
+            if event == "chunk":
+                delta = str(data.get("text") or "")
+                assembled += delta
+                if assistant_placeholder is not None:
+                    assistant_placeholder.markdown(assembled)
+            elif event == "result":
+                if isinstance(data, dict):
+                    result_payload = data
+            elif event == "error":
+                err = str(data.get("message") or "Unknown error")
+                if bool(st.session_state.get("debug")):
+                    debug_events.append({"event": event, "data": data, "ts": _utc_now_iso(), "request_id": request_id})
+                assembled += f"\n\nError: {err}"
+                if assistant_placeholder is not None:
+                    assistant_placeholder.markdown(assembled)
+            elif event == "done":
+                break
+            else:
+                if bool(st.session_state.get("debug")):
+                    debug_events.append({"event": event, "data": data, "ts": _utc_now_iso(), "request_id": request_id})
+    except Exception as exc:
+        assembled += f"\n\nError: {exc}"
+        if assistant_placeholder is not None:
+            assistant_placeholder.markdown(assembled)
+
+    _append_message(
+        "assistant",
+        assembled.strip() or "(no answer)",
+        request_id=request_id,
+        result=result_payload,
+        debug_events=debug_events if bool(st.session_state.get("debug")) else None,
+    )
+    st.rerun()
+
+
+if __name__ == "__main__":
+    main()

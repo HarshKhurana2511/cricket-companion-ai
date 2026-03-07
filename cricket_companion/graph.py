@@ -31,7 +31,132 @@ class GraphState(TypedDict, total=False):
     errors: list[dict[str, Any]]
 
 
-def build_graph():
+def compose_assistant_output(*, state: "ChatState", tool_plan: dict[str, Any] | None) -> "AssistantOutput":
+    """
+    Deterministic response composition (used by the graph and streaming API).
+
+    This function intentionally does not do LLM composing; that is layered on top (2.7.0/2.7.2).
+    """
+    from cricket_companion.output_models import AssistantOutput
+
+    plan = tool_plan or {}
+    calls = plan.get("calls") or []
+
+    if state.route == "unknown":
+        answer = state.clarifying_question or "Can you clarify what you want?"
+        return AssistantOutput(answer_text=answer, citations=[], tables=[], charts=[])
+
+    if state.route == "basic":
+        from cricket_companion.basic_response import build_basic_output
+
+        retrieval_trace = next((t for t in reversed(state.tool_traces) if t.tool_name == "retrieval"), None)
+        if retrieval_trace is None:
+            return AssistantOutput(
+                answer_text="I couldn't run retrieval for this question. Please try again.",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["Missing retrieval tool trace."],
+            )
+        if retrieval_trace.error is not None:
+            return AssistantOutput(
+                answer_text=f"Retrieval tool error: {retrieval_trace.error.code}: {retrieval_trace.error.message}",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["Retrieval tool execution failed before returning hits."],
+            )
+
+        resp = retrieval_trace.response if isinstance(retrieval_trace.response, dict) else None
+        ok = bool(resp.get("ok")) if resp is not None else False
+        if not ok:
+            err = (resp or {}).get("error") or {}
+            code = err.get("code") or "UNKNOWN"
+            msg = err.get("message") or "Retrieval failed."
+            return AssistantOutput(
+                answer_text=f"Couldn't retrieve supporting docs ({code}): {msg}",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["No basic answer was composed because retrieval returned ok=false."],
+            )
+
+        return build_basic_output(question=state.user_message.content, retrieval_tool_response=resp or {})
+
+    if state.route == "analyst":
+        from cricket_companion.analyst_response import build_analyst_output
+
+        stats_trace = next((t for t in reversed(state.tool_traces) if t.tool_name == "stats"), None)
+        if stats_trace is None:
+            return AssistantOutput(
+                answer_text="I couldn't run the stats tool for this question. Please try again.",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["Missing stats tool trace."],
+            )
+        if stats_trace.error is not None:
+            return AssistantOutput(
+                answer_text=f"Stats tool error: {stats_trace.error.code}: {stats_trace.error.message}",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["Stats tool execution failed before a SQL result was produced."],
+            )
+
+        resp = stats_trace.response if isinstance(stats_trace.response, dict) else None
+        ok = bool(resp.get("ok")) if resp is not None else False
+        if not ok:
+            err = (resp or {}).get("error") or {}
+            code = err.get("code") or "UNKNOWN"
+            msg = err.get("message") or "Stats query failed."
+            details = err.get("details") or {}
+            clarifying = details.get("clarifying_question") if isinstance(details, dict) else None
+
+            answer = clarifying or f"Couldn't compute stats ({code}): {msg}"
+            return AssistantOutput(
+                answer_text=answer,
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["No stats claims were made because the SQL tool did not return ok=true."],
+                assumptions=["Dataset is IPL men (Cricsheet) only."],
+            )
+        if not state.tables:
+            return AssistantOutput(
+                answer_text="Stats query succeeded but returned no table output to ground an answer.",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["No stats claims were made because there was no SQL table output."],
+                assumptions=["Dataset is IPL men (Cricsheet) only."],
+            )
+
+        return build_analyst_output(
+            table=state.tables[0],
+            citations=state.citations,
+            warnings=[],
+            assumptions=[
+                "Dataset is IPL men (Cricsheet) only.",
+                "Economy/run rates use legal balls (wides/no-balls excluded from ball counts).",
+                "Bowler wickets exclude non-bowler dismissals (e.g., run outs) where applicable.",
+            ],
+        )
+
+    call_lines = []
+    for call in calls:
+        call_lines.append(f"- {call.get('tool_name')} args={call.get('args')}")
+    planned = "\n".join(call_lines) if call_lines else "(no tools planned)"
+    answer = (
+        f"Route: {state.route}\n"
+        f"Reason: {state.route_reason or '(none)'}\n\n"
+        f"Planned tool calls:\n{planned}\n\n"
+        "Next: richer grounded response composition will be added in later tasks."
+    )
+    return AssistantOutput(answer_text=answer, citations=state.citations, tables=state.tables, charts=state.charts)
+
+
+def build_graph(*, enable_composer: bool = True):
     """
     Build and compile the LangGraph for the agent core.
 
@@ -52,6 +177,7 @@ def build_graph():
     from cricket_companion.executor import execute_tool_plan
     from cricket_companion.planner import plan_tools
     from cricket_companion.router import route_intent
+    from cricket_companion.llm_composer import compose_answer_with_llm
 
     def route_node(state: GraphState) -> GraphState:
         s = ChatState.model_validate(state)
@@ -73,118 +199,23 @@ def build_graph():
     def respond_node(state: GraphState) -> GraphState:
         s = ChatState.model_validate(state)
         plan = (state.get("tool_plan") or {})
-        calls = plan.get("calls") or []
+        output = compose_assistant_output(state=s, tool_plan=plan if isinstance(plan, dict) else None)
 
-        if s.route == "unknown":
-            answer = s.clarifying_question or "Can you clarify what you want?"
-            output = AssistantOutput(answer_text=answer, citations=[], tables=[], charts=[])
-        elif s.route == "basic":
-            from cricket_companion.basic_response import build_basic_output
-
-            retrieval_trace = next((t for t in reversed(s.tool_traces) if t.tool_name == "retrieval"), None)
-            if retrieval_trace is None:
-                output = AssistantOutput(
-                    answer_text="I couldn't run retrieval for this question. Please try again.",
-                    citations=[],
-                    tables=[],
-                    charts=[],
-                    warnings=["Missing retrieval tool trace."],
-                )
-            elif retrieval_trace.error is not None:
-                output = AssistantOutput(
-                    answer_text=f"Retrieval tool error: {retrieval_trace.error.code}: {retrieval_trace.error.message}",
-                    citations=[],
-                    tables=[],
-                    charts=[],
-                    warnings=["Retrieval tool execution failed before returning hits."],
-                )
-            else:
-                resp = retrieval_trace.response if isinstance(retrieval_trace.response, dict) else None
-                ok = bool(resp.get("ok")) if resp is not None else False
-                if not ok:
-                    err = (resp or {}).get("error") or {}
-                    code = err.get("code") or "UNKNOWN"
-                    msg = err.get("message") or "Retrieval failed."
-                    output = AssistantOutput(
-                        answer_text=f"Couldn't retrieve supporting docs ({code}): {msg}",
-                        citations=[],
-                        tables=[],
-                        charts=[],
-                        warnings=["No basic answer was composed because retrieval returned ok=false."],
-                    )
-                else:
-                    output = build_basic_output(question=s.user_message.content, retrieval_tool_response=resp or {})
-        elif s.route == "analyst":
-            from cricket_companion.analyst_response import build_analyst_output
-
-            stats_trace = next((t for t in reversed(s.tool_traces) if t.tool_name == "stats"), None)
-            if stats_trace is None:
-                output = AssistantOutput(
-                    answer_text="I couldn't run the stats tool for this question. Please try again.",
-                    citations=[],
-                    tables=[],
-                    charts=[],
-                    warnings=["Missing stats tool trace."],
-                )
-            elif stats_trace.error is not None:
-                output = AssistantOutput(
-                    answer_text=f"Stats tool error: {stats_trace.error.code}: {stats_trace.error.message}",
-                    citations=[],
-                    tables=[],
-                    charts=[],
-                    warnings=["Stats tool execution failed before a SQL result was produced."],
-                )
-            else:
-                resp = stats_trace.response if isinstance(stats_trace.response, dict) else None
-                ok = bool(resp.get("ok")) if resp is not None else False
-                if not ok:
-                    err = (resp or {}).get("error") or {}
-                    code = err.get("code") or "UNKNOWN"
-                    msg = err.get("message") or "Stats query failed."
-                    details = err.get("details") or {}
-                    clarifying = details.get("clarifying_question") if isinstance(details, dict) else None
-
-                    answer = clarifying or f"Couldn't compute stats ({code}): {msg}"
-                    output = AssistantOutput(
-                        answer_text=answer,
-                        citations=[],
-                        tables=[],
-                        charts=[],
-                        warnings=["No stats claims were made because the SQL tool did not return ok=true."],
-                        assumptions=["Dataset is IPL men (Cricsheet) only."],
-                    )
-                elif not s.tables:
-                    output = AssistantOutput(
-                        answer_text="Stats query succeeded but returned no table output to ground an answer.",
-                        citations=[],
-                        tables=[],
-                        charts=[],
-                        warnings=["No stats claims were made because there was no SQL table output."],
-                        assumptions=["Dataset is IPL men (Cricsheet) only."],
-                    )
-                else:
-                    output = build_analyst_output(
-                        table=s.tables[0],
-                        citations=s.citations,
-                        warnings=[],
-                        assumptions=[
-                            "Dataset is IPL men (Cricsheet) only.",
-                            "Economy/run rates use legal balls (wides/no-balls excluded from ball counts).",
-                            "Bowler wickets exclude non-bowler dismissals (e.g., run outs) where applicable.",
-                        ],
-                    )
-        else:
-            call_lines = []
-            for call in calls:
-                call_lines.append(f"- {call.get('tool_name')} args={call.get('args')}")
-            planned = "\n".join(call_lines) if call_lines else "(no tools planned)"
-            answer = (
-                f"Route: {s.route}\n"
-                f"Reason: {s.route_reason or '(none)'}\n\n"
-                f"Planned tool calls:\n{planned}\n\n"
-                "Next: richer grounded response composition will be added in later tasks."
+        # Phase 2.7.0: LLM composer pass (best-effort). Falls back to deterministic output on failure.
+        if enable_composer:
+            composed = compose_answer_with_llm(
+                route=s.route,
+                user_message=s.user_message.content,
+                draft_answer_text=output.answer_text,
+                tool_plan=plan if isinstance(plan, dict) else None,
+                tool_traces=[t.model_dump(mode="json") for t in s.tool_traces],
+                citations=[c.model_dump(mode="json") for c in output.citations],
+                tables=[t.model_dump(mode="json") for t in output.tables],
+                prefs=s.prefs,
+                session_summary=s.summary,
             )
-            output = AssistantOutput(answer_text=answer, citations=s.citations, tables=s.tables, charts=s.charts)
+            if composed is not None:
+                output.answer_text = composed
 
         s.final_answer = output.answer_text
         s.assistant_output = output

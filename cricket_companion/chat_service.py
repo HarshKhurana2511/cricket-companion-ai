@@ -7,6 +7,8 @@ from typing import Any
 from cricket_companion.chat_models import ChatRequest, ChatResponse, ChatState, Message
 from cricket_companion.config import Settings, get_settings
 from cricket_companion.memory_store import MemoryStore
+from cricket_companion.llm_composer import extract_numbers
+from cricket_companion.llm_composer import stream_compose_answer_with_llm
 
 
 def _parse_pref_value(raw: str) -> Any:
@@ -304,6 +306,193 @@ def handle_chat(request: ChatRequest, *, settings: Settings | None = None) -> Ch
             tool_traces=[t for t in (result.get("tool_traces") or [])],
             errors=[e for e in (result.get("errors") or [])],
         )
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def stream_chat(request: ChatRequest, *, settings: Settings | None = None) -> Any:
+    """
+    Phase 2.7.2: Streaming chat generator.
+
+    Yields events shaped like: {"event": str, "data": dict}.
+
+    Streaming scope (A): stream only the final LLM composer output. Tool execution is still synchronous.
+    """
+    effective_settings = settings or get_settings(load_env_file=True)
+    store = MemoryStore(db_path=effective_settings.memory_db_path)
+    con = store.connect()
+
+    def emit(event: str, data: dict[str, Any]) -> dict[str, Any]:
+        return {"event": event, "data": data}
+
+    try:
+        user_id = request.user_id or "local-user"
+
+        # Handle governance and prefs deterministically (single-chunk stream).
+        mem_resp = _handle_mem_command(
+            store,
+            con,
+            user_id=user_id,
+            session_id=request.session_id,
+            artifacts_dir=effective_settings.artifacts_dir,
+            text=request.message.content,
+        )
+        if mem_resp is not None:
+            assistant_message = Message(role="assistant", content=mem_resp)
+            store.append_messages(
+                con,
+                session_id=request.session_id,
+                user_id=user_id,
+                messages=[request.message.model_dump(mode="json"), assistant_message.model_dump(mode="json")],
+            )
+            store.summarize_if_needed(
+                con,
+                session_id=request.session_id,
+                keep_last_n=effective_settings.memory_keep_last_n,
+                summarize_chunk_n=effective_settings.memory_summarize_chunk_n,
+                summary_max_chars=effective_settings.memory_summary_max_chars,
+                summary_model=effective_settings.summary_model,
+                openai_api_key=effective_settings.openai_api_key,
+            )
+            yield emit("chunk", {"text": mem_resp})
+            yield emit("done", {"ok": True})
+            return
+
+        pref_resp = _handle_pref_command(store, con, user_id=user_id, text=request.message.content)
+        if pref_resp is not None:
+            assistant_message = Message(role="assistant", content=pref_resp)
+            store.append_messages(
+                con,
+                session_id=request.session_id,
+                user_id=user_id,
+                messages=[request.message.model_dump(mode="json"), assistant_message.model_dump(mode="json")],
+            )
+            store.summarize_if_needed(
+                con,
+                session_id=request.session_id,
+                keep_last_n=effective_settings.memory_keep_last_n,
+                summarize_chunk_n=effective_settings.memory_summarize_chunk_n,
+                summary_max_chars=effective_settings.memory_summary_max_chars,
+                summary_model=effective_settings.summary_model,
+                openai_api_key=effective_settings.openai_api_key,
+            )
+            yield emit("chunk", {"text": pref_resp})
+            yield emit("done", {"ok": True})
+            return
+
+        # Stream timeline events by running route -> plan -> tools -> respond manually.
+        from cricket_companion.executor import execute_tool_plan_iter
+        from cricket_companion.graph import compose_assistant_output
+        from cricket_companion.planner import plan_tools
+        from cricket_companion.router import route_intent
+
+        ctx = store.load_context(
+            con,
+            session_id=request.session_id,
+            user_id=user_id,
+            max_messages=request.max_context_messages,
+        )
+        prefs = store.load_preferences(con, user_id=user_id)
+
+        state = ChatState(
+            session_id=request.session_id,
+            request_id=request.request_id,
+            user_id=user_id,
+            user_message=request.message,
+            messages=[Message.model_validate(m) for m in ctx.messages],
+            summary=ctx.summary,
+            prefs=prefs,
+        )
+
+        state = route_intent(state, settings=effective_settings)
+        yield emit(
+            "route",
+            {
+                "route": state.route,
+                "route_reason": state.route_reason,
+                "clarifying_question": state.clarifying_question,
+            },
+        )
+
+        plan = plan_tools(state, settings=effective_settings)
+        state.tool_plan = plan.model_dump(mode="json")
+        yield emit("plan", {"tool_plan": state.tool_plan})
+
+        for evt in execute_tool_plan_iter(state):
+            if isinstance(evt, dict) and "event" in evt and "data" in evt:
+                yield emit(str(evt["event"]), dict(evt["data"]))
+
+        output = compose_assistant_output(state=state, tool_plan=state.tool_plan if isinstance(state.tool_plan, dict) else None)
+        # This draft is what the LLM composer streams (2.7.2 A).
+        draft = output.answer_text.strip() or "(no answer)"
+        route = state.route
+
+        # Stream the final composer (A). If unavailable, fall back to streaming the deterministic draft.
+        deltas = stream_compose_answer_with_llm(
+            route=route,
+            user_message=request.message.content,
+            draft_answer_text=draft,
+            tool_plan=state.tool_plan if isinstance(state.tool_plan, dict) else None,
+            tool_traces=[t.model_dump(mode="json") for t in state.tool_traces],
+            citations=[c.model_dump(mode="json") for c in output.citations],
+            tables=[t.model_dump(mode="json") for t in output.tables],
+            prefs=prefs,
+            session_summary=ctx.summary,
+            settings=effective_settings,
+        )
+
+        buf: list[str] = []
+        any_streamed = False
+        for d in deltas:
+            any_streamed = True
+            buf.append(str(d))
+            yield emit("chunk", {"text": str(d)})
+
+        composed = "".join(buf).strip() if any_streamed else None
+        final_text = composed or draft
+
+        # Post-validate analyst numbers: if composer introduced new numbers, discard it.
+        if composed and route == "analyst":
+            if extract_numbers(composed) - extract_numbers(draft):
+                final_text = draft
+
+        assistant_message = Message(role="assistant", content=final_text)
+
+        store.append_messages(
+            con,
+            session_id=request.session_id,
+            user_id=user_id,
+            messages=[request.message.model_dump(mode="json"), assistant_message.model_dump(mode="json")],
+        )
+        store.summarize_if_needed(
+            con,
+            session_id=request.session_id,
+            keep_last_n=effective_settings.memory_keep_last_n,
+            summarize_chunk_n=effective_settings.memory_summarize_chunk_n,
+            summary_max_chars=effective_settings.memory_summary_max_chars,
+            summary_model=effective_settings.summary_model,
+            openai_api_key=effective_settings.openai_api_key,
+        )
+
+        resp = ChatResponse(
+            session_id=request.session_id,
+            request_id=request.request_id,
+            assistant_message=assistant_message,
+            citations=output.citations,
+            tables=output.tables,
+            charts=output.charts,
+            route=state.route,
+            tool_traces=state.tool_traces,
+            errors=state.errors,
+        )
+        yield emit("result", resp.model_dump(mode="json"))
+        yield emit("done", {"ok": True})
+    except Exception as exc:
+        yield emit("error", {"message": str(exc)})
+        yield emit("done", {"ok": False})
     finally:
         try:
             con.close()

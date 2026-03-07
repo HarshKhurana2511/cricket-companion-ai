@@ -100,6 +100,9 @@ class Settings:
     memory_summary_max_chars: int
     summary_model: str
 
+    composer_model: str
+    composer_max_chars: int
+
     @property
     def is_prod(self) -> bool:
         return self.env.lower() in {"prod", "production"}
@@ -161,4 +164,7 @@ def get_settings(*, load_env_file: bool = True) -> Settings:
         memory_summarize_chunk_n=_getenv_int("MEMORY_SUMMARIZE_CHUNK_N", 10),
         memory_summary_max_chars=_getenv_int("MEMORY_SUMMARY_MAX_CHARS", 2000),
         summary_model=_getenv("SUMMARY_MODEL", _getenv("MODEL", "gpt-4o-mini") or "gpt-4o-mini") or "gpt-4o-mini",
+
+        composer_model=_getenv("COMPOSER_MODEL", _getenv("MODEL", "gpt-4o-mini") or "gpt-4o-mini") or "gpt-4o-mini",
+        composer_max_chars=_getenv_int("COMPOSER_MAX_CHARS", 2000),
     )
