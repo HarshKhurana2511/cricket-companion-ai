@@ -87,6 +87,7 @@ def _extract_with_llm(state: ChatState, settings: Settings, *, kind: Literal["ba
 
     payload = {
         "session_summary": state.summary,
+        "user_prefs": state.prefs,
         # Avoid sending datetimes to the LLM (json.dumps can't serialize them by default).
         "recent_messages": [m.model_dump(exclude={"created_at"}) for m in state.messages[-6:]],
         "current_message": state.user_message.model_dump(exclude={"created_at"}),
@@ -129,11 +130,13 @@ def plan_tools(state: ChatState, *, settings: Settings | None = None) -> ToolPla
     if state.route == "basic":
         extracted = _extract_with_llm(state, effective_settings, kind="basic")
         query = (extracted or {}).get("query") or state.user_message.content
+        top_k_pref = state.prefs.get("retrieval_top_k")
+        top_k = int(top_k_pref) if isinstance(top_k_pref, int) and 1 <= int(top_k_pref) <= 50 else 5
 
         calls: list[PlannedToolCall] = [
             PlannedToolCall(
                 tool_name="retrieval",
-                args={"query": query, "top_k": 5},
+                args={"query": query, "top_k": top_k},
                 timeout_s=effective_settings.timeout_retrieval_s,
                 use_cache=True,
                 note="RAG over curated cricket knowledge",
@@ -157,6 +160,25 @@ def plan_tools(state: ChatState, *, settings: Settings | None = None) -> ToolPla
     if state.route == "analyst":
         extracted = _extract_with_llm(state, effective_settings, kind="analyst")
         spec = extracted or {"question": state.user_message.content, "limit": 20}
+
+        # Apply user preferences only to missing fields (never override explicit user inputs).
+        fmt = spec.get("format")
+        if fmt in {None, ""} and isinstance(state.prefs.get("default_format"), str):
+            spec["format"] = state.prefs["default_format"]
+        if spec.get("since_year") is None and isinstance(state.prefs.get("default_since_year"), int):
+            spec["since_year"] = state.prefs["default_since_year"]
+        if spec.get("until_year") is None and isinstance(state.prefs.get("default_until_year"), int):
+            spec["until_year"] = state.prefs["default_until_year"]
+
+        # Limit is always present due to schema defaults; only apply a default limit preference when the user
+        # didn't ask for a specific top-N and didn't mention a limit.
+        text = state.user_message.content or ""
+        if (
+            isinstance(state.prefs.get("default_limit"), int)
+            and not re.search(r"\btop\s+\d+\b", text, flags=re.IGNORECASE)
+            and not re.search(r"\blimit\b", text, flags=re.IGNORECASE)
+        ):
+            spec["limit"] = int(state.prefs["default_limit"])
 
         return ToolPlan(
             route="analyst",

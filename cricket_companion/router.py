@@ -189,6 +189,7 @@ def llm_route(state: ChatState, settings: Settings) -> RouteDecision:
 
     user = {
         "session_summary": state.summary,
+        "user_prefs": state.prefs,
         # Avoid sending datetimes to the LLM (json.dumps can't serialize them by default).
         "recent_messages": [m.model_dump(exclude={"created_at"}) for m in state.messages[-6:]],
         "current_message": state.user_message.model_dump(exclude={"created_at"}),

@@ -94,6 +94,12 @@ class Settings:
     router_heuristic_min_score: int
     router_heuristic_margin: int
 
+    memory_db_path: Path
+    memory_keep_last_n: int
+    memory_summarize_chunk_n: int
+    memory_summary_max_chars: int
+    summary_model: str
+
     @property
     def is_prod(self) -> bool:
         return self.env.lower() in {"prod", "production"}
@@ -121,6 +127,7 @@ def get_settings(*, load_env_file: bool = True) -> Settings:
     artifacts_dir = _getenv_path("ARTIFACTS_DIR", Path("artifacts"))
     cache_dir = _getenv_path("CACHE_DIR", Path("cache"))
     logs_dir = _getenv_path("LOGS_DIR", Path("logs"))
+    memory_db_path = _getenv_path("MEMORY_DB_PATH", Path("data/duckdb/cricket_companion_memory.duckdb"))
 
     router_mode = (_getenv("ROUTER_MODE", "real") or "real").strip().lower()
     default_min_score = 3 if router_mode == "easy" else 5
@@ -148,4 +155,10 @@ def get_settings(*, load_env_file: bool = True) -> Settings:
         router_mode=router_mode,
         router_heuristic_min_score=_getenv_int("ROUTER_MIN_SCORE", default_min_score),
         router_heuristic_margin=_getenv_int("ROUTER_MARGIN", default_margin),
+
+        memory_db_path=memory_db_path,
+        memory_keep_last_n=_getenv_int("MEMORY_KEEP_LAST_N", 20),
+        memory_summarize_chunk_n=_getenv_int("MEMORY_SUMMARIZE_CHUNK_N", 10),
+        memory_summary_max_chars=_getenv_int("MEMORY_SUMMARY_MAX_CHARS", 2000),
+        summary_model=_getenv("SUMMARY_MODEL", _getenv("MODEL", "gpt-4o-mini") or "gpt-4o-mini") or "gpt-4o-mini",
     )

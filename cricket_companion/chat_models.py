@@ -30,6 +30,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid4()))
     request_id: str = Field(default_factory=lambda: str(uuid4()))
+    user_id: str = "local-user"
     message: Message
     debug: bool = False
     max_context_messages: int = 30
@@ -72,10 +73,12 @@ class ChatState(BaseModel):
 
     session_id: str
     request_id: str
+    user_id: str = "local-user"
 
     user_message: Message
     messages: list[Message] = Field(default_factory=list)
     summary: str | None = None
+    prefs: dict[str, Any] = Field(default_factory=dict)
 
     route: Route = "unknown"
     route_reason: str | None = None
