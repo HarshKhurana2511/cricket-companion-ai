@@ -46,7 +46,8 @@ class _AnalystExtraction(BaseModel):
 def _needs_web(text: str) -> bool:
     return bool(
         re.search(
-            r"\b(latest|today|yesterday|current|news|injury|availability|squad|playing\s*xi|update)\b",
+            # "web:" is an explicit user override to force web tooling even if freshness keywords are absent.
+            r"(\bweb\s*:|\b(latest|today|yesterday|current|news|injury|availability|squad|playing\s*xi|update)\b)",
             text,
             flags=re.IGNORECASE,
         )

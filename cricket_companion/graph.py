@@ -81,7 +81,19 @@ def compose_assistant_output(*, state: "ChatState", tool_plan: dict[str, Any] | 
                 warnings=["No basic answer was composed because retrieval returned ok=false."],
             )
 
-        return build_basic_output(question=state.user_message.content, retrieval_tool_response=resp or {})
+        output = build_basic_output(question=state.user_message.content, retrieval_tool_response=resp or {})
+        # Merge in any web citations collected during tool execution (web_search/web_fetch/espn_ingest).
+        # Keep the list small and de-duplicated by URL.
+        if state.citations:
+            seen: set[str] = {c.url for c in output.citations}
+            for c in state.citations:
+                if c.url in seen:
+                    continue
+                output.citations.append(c)
+                seen.add(c.url)
+                if len(output.citations) >= 6:
+                    break
+        return output
 
     if state.route == "analyst":
         from cricket_companion.analyst_response import build_analyst_output

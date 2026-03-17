@@ -32,12 +32,13 @@ def _retrieval_dir() -> str:
 
 
 @lru_cache(maxsize=1)
-def _artifact_paths() -> tuple[str, str]:
+def _artifact_paths() -> tuple[str, str, str]:
     retrieval_dir = _retrieval_dir()
     retrieval_dir_abs = os.path.join(_repo_root(), retrieval_dir) if not os.path.isabs(retrieval_dir) else retrieval_dir
     index_path = os.path.join(retrieval_dir_abs, "knowledge.faiss")
     chunks_path = os.path.join(retrieval_dir_abs, "chunks.jsonl")
-    return index_path, chunks_path
+    web_chunks_path = os.path.join(retrieval_dir_abs, "web_chunks.jsonl")
+    return index_path, chunks_path, web_chunks_path
 
 
 def _load_chunks_jsonl(path: str) -> list[dict[str, Any]]:
@@ -53,16 +54,20 @@ def _load_chunks_jsonl(path: str) -> list[dict[str, Any]]:
 
 @lru_cache(maxsize=1)
 def _get_index() -> Any:
-    index_path, _ = _artifact_paths()
+    index_path, _, _ = _artifact_paths()
     import faiss  # type: ignore
 
     return faiss.read_index(index_path)
 
 
-@lru_cache(maxsize=1)
 def _get_chunks() -> list[dict[str, Any]]:
-    _, chunks_path = _artifact_paths()
-    return _load_chunks_jsonl(chunks_path)
+    _, chunks_path, web_chunks_path = _artifact_paths()
+    chunks: list[dict[str, Any]] = []
+    if os.path.exists(chunks_path):
+        chunks.extend(_load_chunks_jsonl(chunks_path))
+    if os.path.exists(web_chunks_path):
+        chunks.extend(_load_chunks_jsonl(web_chunks_path))
+    return chunks
 
 
 @lru_cache(maxsize=1)
@@ -127,7 +132,6 @@ def _tokenize(text: str) -> set[str]:
     return {t for t in tokens if len(t) >= 3 and t not in _STOPWORDS}
 
 
-@lru_cache(maxsize=1)
 def _get_chunk_tokens() -> list[set[str]]:
     return [_tokenize(str(c.get("text", ""))) for c in _get_chunks()]
 
@@ -258,13 +262,17 @@ def _tools_call(params: dict[str, Any]) -> dict[str, Any]:
             "isError": True,
         }
 
-    index_path, chunks_path = _artifact_paths()
+    index_path, chunks_path, web_chunks_path = _artifact_paths()
 
-    if not os.path.exists(chunks_path):
+    if not os.path.exists(chunks_path) and not os.path.exists(web_chunks_path):
         resp = ToolResponse.failure(
             code=ErrorCode.NOT_FOUND,
-            message="Retrieval chunks not found. Build them first with: uv run python pipelines/build_knowledge_index.py",
-            details={"expected": {"chunks": chunks_path, "index": index_path}},
+            message=(
+                "Retrieval chunks not found. Build them first with:\n"
+                "- uv run python pipelines/build_knowledge_index.py\n"
+                "- uv run python pipelines/build_web_index.py"
+            ),
+            details={"expected": {"chunks": chunks_path, "web_chunks": web_chunks_path, "index": index_path}},
             meta=ToolMeta(request_id=request_id),
         )
         return {

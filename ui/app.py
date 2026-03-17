@@ -228,14 +228,66 @@ def _render_details_panel() -> None:
                     )
 
     with tabs[1]:
-        if not debug_events:
-            st.info("No debug events captured.")
-        else:
-            for e in debug_events[-200:]:
-                ev = str(e.get("event") or "")
-                ts = str(e.get("ts") or "")
-                with st.expander(f"{ts}  {ev}", expanded=False):
-                    st.json(e.get("data") or {}, expanded=False)
+        debug_tabs = st.tabs(["Tool Traces", "Timeline"])
+
+        with debug_tabs[0]:
+            if not isinstance(result, dict):
+                st.info("No result payload captured for this message.")
+            else:
+                traces = result.get("tool_traces") or []
+                if not traces:
+                    st.info("No tool traces captured.")
+                for t in traces:
+                    if not isinstance(t, dict):
+                        continue
+                    tool_name = str(t.get("tool_name") or "tool")
+                    elapsed_ms = t.get("elapsed_ms")
+                    cache_hit = t.get("cache_hit")
+                    cache_key = t.get("cache_key")
+                    ok = None
+                    resp = t.get("response") if isinstance(t.get("response"), dict) else None
+                    if isinstance(resp, dict):
+                        ok = resp.get("ok")
+
+                    suffix = []
+                    if isinstance(ok, bool):
+                        suffix.append(f"ok={ok}")
+                    if isinstance(elapsed_ms, int):
+                        suffix.append(f"{elapsed_ms}ms")
+                    if isinstance(cache_hit, bool):
+                        suffix.append(f"cache_hit={cache_hit}")
+                    if isinstance(cache_key, str) and cache_key:
+                        suffix.append(f"cache_key={cache_key}")
+
+                    title = tool_name if not suffix else f"{tool_name} ({', '.join(suffix)})"
+                    with st.expander(title, expanded=False):
+                        cols = st.columns(2)
+                        with cols[0]:
+                            st.caption("Request")
+                            st.json(t.get("request") or {}, expanded=False)
+                        with cols[1]:
+                            st.caption("Response")
+                            st.json(t.get("response") or {}, expanded=False)
+
+                        citations = t.get("citations") or []
+                        if citations:
+                            st.caption("Citations")
+                            st.json(citations, expanded=False)
+
+                        err = t.get("error")
+                        if err:
+                            st.caption("Error")
+                            st.json(err, expanded=False)
+
+        with debug_tabs[1]:
+            if not debug_events:
+                st.info("No debug events captured.")
+            else:
+                for e in debug_events[-200:]:
+                    ev = str(e.get("event") or "")
+                    ts = str(e.get("ts") or "")
+                    with st.expander(f"{ts}  {ev}", expanded=False):
+                        st.json(e.get("data") or {}, expanded=False)
 
     with tabs[2]:
         st.json({"message": m, "result": result, "debug_events": debug_events}, expanded=False)

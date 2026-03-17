@@ -73,11 +73,29 @@ def _extract_hits(tool_response: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _make_citation(hit: dict[str, Any]) -> Citation:
     source_id = str(hit.get("source_id") or "")
-    heading = str(((hit.get("metadata") or {}) if isinstance(hit.get("metadata"), dict) else {}).get("heading") or "")
+    meta = (hit.get("metadata") or {}) if isinstance(hit.get("metadata"), dict) else {}
+    heading = str(meta.get("heading") or "")
+    title = str(meta.get("title") or "").strip() or (heading or None)
+
+    fetched_at = _utc_now()
+    raw_fetched = meta.get("fetched_at")
+    if isinstance(raw_fetched, str) and raw_fetched:
+        try:
+            parsed = datetime.fromisoformat(raw_fetched.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            fetched_at = parsed
+        except Exception:
+            pass
+
+    # If the source_id itself is a URL (web indexing), cite it directly.
+    if source_id.startswith("http://") or source_id.startswith("https://"):
+        return Citation(url=source_id, fetched_at=fetched_at, title=title)
+
+    # Otherwise cite local docs with a stable anchor.
     anchor = _slug(heading) if heading else ""
     url = f"doc:{source_id}" + (f"#{anchor}" if anchor else "")
-    title = heading or None
-    return Citation(url=url, fetched_at=_utc_now(), title=title)
+    return Citation(url=url, fetched_at=fetched_at, title=title)
 
 
 def _shorten(text: str, *, max_chars: int) -> str:

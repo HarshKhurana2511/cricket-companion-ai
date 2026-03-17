@@ -32,7 +32,7 @@ _SIGNALS: list[_HeuristicSignal] = [
         weight=3,
         label="basic_keywords",
         pattern=re.compile(
-            r"\b(explain|define|meaning|rules|difference|what\s+is|what's|whats|when\s+is|how\s+do)\b",
+            r"\b(explain|define|meaning|web|rules|difference|what\s+is|what's|whats|when\s+is|how\s+do)\b",
             re.IGNORECASE,
         ),
     ),
@@ -41,7 +41,7 @@ _SIGNALS: list[_HeuristicSignal] = [
         weight=6,
         label="basic_define_metric",
         pattern=re.compile(
-            r"\b(what\s+is|define|meaning\s+of|explain)\s+(batting\s+)?(average|strike\s*rate|economy|run\s*rate|nrr|net\s*run\s*rate)\b",
+            r"\b(what\s+is|define|web|meaning\s+of|explain)\s+(batting\s+)?(average|strike\s*rate|economy|run\s*rate|nrr|net\s*run\s*rate)\b",
             re.IGNORECASE,
         ),
     ),
