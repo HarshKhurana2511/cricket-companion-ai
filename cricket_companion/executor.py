@@ -8,7 +8,7 @@ from cricket_companion.chat_models import ChatState, ToolCallTrace
 from cricket_companion.output_models import TableArtifact
 from cricket_companion.planner import PlannedToolCall, ToolPlan
 from cricket_companion.schemas import Citation, ErrorCode, ToolError
-from cricket_companion.tools import RetrievalMcpClient, StatsMcpClient, WebMcpClient
+from cricket_companion.tools import RetrievalMcpClient, SimMcpClient, StatsMcpClient, WebMcpClient
 from cricket_companion.logging_config import get_logger
 from cricket_companion.config import get_settings
 
@@ -60,10 +60,11 @@ def execute_tool_plan_iter(state: ChatState) -> Any:
     stats_client: StatsMcpClient | None = None
     retrieval_client: RetrievalMcpClient | None = None
     web_client: WebMcpClient | None = None
+    sim_client: SimMcpClient | None = None
     settings = get_settings()
 
     def _iter():
-        nonlocal stats_client, retrieval_client, web_client
+        nonlocal stats_client, retrieval_client, web_client, sim_client
         try:
             for call in plan.calls:
                 started_at = _utc_now()
@@ -145,8 +146,12 @@ def execute_tool_plan_iter(state: ChatState) -> Any:
                                     secondary_calls.append(("web_fetch", {"url": first_url, "mode": "article", "max_chars": 8000}))
                         except Exception:
                             pass
-                    elif call.tool_name in {"sim", "fantasy"}:
-                        tool_error = ToolError(code=ErrorCode.NOT_FOUND, message=f"{call.tool_name} not implemented yet.")
+                    elif call.tool_name == "sim":
+                        sim_client = sim_client or SimMcpClient()
+                        resp = sim_client.run(call.args)
+                        response_any = resp.model_dump(mode="json")
+                    elif call.tool_name == "fantasy":
+                        tool_error = ToolError(code=ErrorCode.NOT_FOUND, message="fantasy not implemented yet.")
                     else:
                         tool_error = ToolError(code=ErrorCode.NOT_FOUND, message=f"Unknown planned tool: {call.tool_name}")
                 except Exception as exc:
@@ -300,6 +305,8 @@ def execute_tool_plan_iter(state: ChatState) -> Any:
                 retrieval_client.close()
             if web_client is not None:
                 web_client.close()
+            if sim_client is not None:
+                sim_client.close()
 
     return _iter()
 

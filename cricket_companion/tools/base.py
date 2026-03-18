@@ -97,8 +97,9 @@ class StdioJsonRpcClient:
                 self._pending.pop(request_id, None)
             raise TimeoutError(f"JSON-RPC call timed out: method={method}") from exc
 
-        if "error" in resp:
-            err = resp["error"] or {}
+        # Some servers may include `"error": null` on success. Treat that as success.
+        if resp.get("error") is not None:
+            err = resp.get("error") or {}
             raise JsonRpcError(code=err.get("code", -1), message=err.get("message", "error"), data=err.get("data"))
 
         return resp.get("result") or {}

@@ -246,6 +246,25 @@ def route_intent(state: ChatState, *, settings: Settings | None = None) -> ChatS
     - Else ask the LLM to classify.
     """
     effective_settings = settings or get_settings()
+
+    # UI / caller override: allow forcing a route via message metadata.
+    try:
+        md = state.user_message.metadata if isinstance(state.user_message.metadata, dict) else {}
+        forced = md.get("force_route")
+        if isinstance(forced, str) and forced in {"basic", "analyst", "sim", "fantasy", "unknown"}:
+            state.route = forced  # type: ignore[assignment]
+            state.route_reason = f"Forced route via message.metadata.force_route={forced!r}"
+            state.clarifying_question = None
+            return state
+        ui_mode = md.get("ui_mode")
+        if isinstance(ui_mode, str) and ui_mode.lower() in {"sim", "simulator", "scenario"}:
+            state.route = "sim"
+            state.route_reason = f"Forced route via message.metadata.ui_mode={ui_mode!r}"
+            state.clarifying_question = None
+            return state
+    except Exception:
+        pass
+
     decision = heuristic_route(
         state,
         min_score=effective_settings.router_heuristic_min_score,

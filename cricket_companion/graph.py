@@ -155,6 +155,43 @@ def compose_assistant_output(*, state: "ChatState", tool_plan: dict[str, Any] | 
             ],
         )
 
+    if state.route == "sim":
+        from cricket_companion.sim_response import build_sim_output
+
+        sim_trace = next((t for t in reversed(state.tool_traces) if t.tool_name == "sim"), None)
+        if sim_trace is None:
+            return AssistantOutput(
+                answer_text="I couldn't run the simulator for this question. Please try again.",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["Missing sim tool trace."],
+            )
+        if sim_trace.error is not None:
+            return AssistantOutput(
+                answer_text=f"Sim tool error: {sim_trace.error.code}: {sim_trace.error.message}",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["Sim tool execution failed before returning output."],
+            )
+
+        resp = sim_trace.response if isinstance(sim_trace.response, dict) else None
+        ok = bool(resp.get("ok")) if resp is not None else False
+        if not ok:
+            err = (resp or {}).get("error") or {}
+            code = err.get("code") or "UNKNOWN"
+            msg = err.get("message") or "Simulation failed."
+            return AssistantOutput(
+                answer_text=f"Couldn't simulate this scenario ({code}): {msg}",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["No sim answer was composed because sim returned ok=false."],
+            )
+
+        return build_sim_output(question=state.user_message.content, sim_tool_response=resp or {}, request_id=state.request_id)
+
     call_lines = []
     for call in calls:
         call_lines.append(f"- {call.get('tool_name')} args={call.get('args')}")

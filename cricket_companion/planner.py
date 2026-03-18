@@ -54,6 +54,163 @@ def _needs_web(text: str) -> bool:
     )
 
 
+def _strip_code_fences(text: str) -> str:
+    t = (text or "").strip()
+    if t.startswith("```") and t.endswith("```"):
+        t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    return t.strip()
+
+
+def _overs_text_to_balls(overs_text: str) -> int | None:
+    """
+    Parses overs like "10", "10.2" into balls (10*6 + 2).
+    """
+    s = (overs_text or "").strip()
+    if not s:
+        return None
+    m = re.fullmatch(r"(\d+)(?:\.(\d))?", s)
+    if not m:
+        return None
+    o = int(m.group(1))
+    b = int(m.group(2) or "0")
+    if b < 0 or b > 5:
+        return None
+    return o * 6 + b
+
+
+def _default_max_overs_for_format(fmt: str) -> int:
+    f = (fmt or "").strip().upper()
+    if f in {"ODI"}:
+        return 50
+    if f in {"TEST"}:
+        # For Test, a "scenario sim" without a session/innings limit isn't well defined. Keep a default,
+        # but the sim tool isn't intended for Tests in baseline mode.
+        return 90
+    # T20/IPL default.
+    return 20
+
+
+def _try_extract_sim_request_from_text(text: str) -> dict[str, Any] | None:
+    """
+    Heuristic extraction for simulator prompts.
+
+    Supports:
+    - JSON payloads that match SimulationRequest
+    - "need X off Y (balls|overs) with Z wkts"
+    - "chasing T, at R/W in O overs"
+    """
+    raw = _strip_code_fences(text)
+
+    # 1) Direct JSON payload.
+    if raw.startswith("{") and raw.endswith("}"):
+        try:
+            payload = json.loads(raw)
+            from cricket_companion.sim_schemas import SimulationRequest
+
+            SimulationRequest.model_validate(payload)
+            return payload
+        except Exception:
+            pass
+
+    # Detect format hint.
+    fmt = "T20"
+    if re.search(r"\bipl\b", raw, flags=re.IGNORECASE):
+        fmt = "IPL"
+    elif re.search(r"\bodi\b", raw, flags=re.IGNORECASE):
+        fmt = "ODI"
+    elif re.search(r"\btest\b", raw, flags=re.IGNORECASE):
+        fmt = "TEST"
+    elif re.search(r"\bt20\b", raw, flags=re.IGNORECASE):
+        fmt = "T20"
+
+    max_overs = _default_max_overs_for_format(fmt)
+    max_balls = max_overs * 6
+    sim_model = "historical_blend" if re.search(r"\b(historical|history|based\s+on\s+history)\b", raw, flags=re.IGNORECASE) else "baseline"
+
+    # 2) "need X off Y ..." style (chase mode).
+    m_need = re.search(
+        r"\bneed(?:s|ed)?\s+(?P<runs>\d+)\s+(?:off|from)\s+(?P<qty>\d+(?:\.\d)?)\s*(?P<unit>balls?|overs?)?\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if m_need:
+        runs_left = int(m_need.group("runs"))
+        qty = m_need.group("qty")
+        unit = (m_need.group("unit") or "").lower().strip()
+        if unit.startswith("over"):
+            balls_left = _overs_text_to_balls(qty)
+        else:
+            # Default: interpret as balls when unit is omitted.
+            balls_left = int(float(qty))
+        if balls_left is None:
+            return None
+
+        wkts_in_hand = 6
+        m_w = re.search(r"\bwith\s+(?P<w>\d+)\s+wickets?\s+(?:in\s+hand|left)\b", raw, flags=re.IGNORECASE)
+        if m_w:
+            wkts_in_hand = int(m_w.group("w"))
+        wkts_in_hand = max(0, min(10, wkts_in_hand))
+
+        balls_elapsed = max(0, max_balls - balls_left)
+        wkts_lost = 10 - wkts_in_hand
+        payload = {
+            "format": fmt,
+            "mode": "chase",
+            "match_state": {
+                "innings": 2,
+                "score": {"runs": 0, "wkts": wkts_lost, "balls": balls_elapsed},
+                "limits": {"max_overs": max_overs},
+                "phase": "unknown",
+                "chase": {"target_runs": runs_left, "revised": False},
+            },
+            "simulation": {"n_sims": 5000, "seed": None, "model": sim_model, "return_distributions": True},
+        }
+        try:
+            from cricket_companion.sim_schemas import SimulationRequest
+
+            SimulationRequest.model_validate(payload)
+            return payload
+        except Exception:
+            return None
+
+    # 3) "chasing T ... R/W in O overs" style.
+    m_score = re.search(
+        r"\b(?P<runs>\d+)\s*/\s*(?P<wkts>\d+)\s+(?:in\s+)?(?P<overs>\d+(?:\.\d)?)\s*overs?\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    m_target = re.search(r"\b(?:chasing|target)\s+(?P<t>\d+)\b", raw, flags=re.IGNORECASE)
+    if m_score and m_target:
+        runs = int(m_score.group("runs"))
+        wkts = int(m_score.group("wkts"))
+        balls = _overs_text_to_balls(m_score.group("overs"))
+        if balls is None:
+            return None
+        target = int(m_target.group("t"))
+        payload = {
+            "format": fmt,
+            "mode": "chase",
+            "match_state": {
+                "innings": 2,
+                "score": {"runs": runs, "wkts": wkts, "balls": balls},
+                "limits": {"max_overs": max_overs},
+                "phase": "unknown",
+                "chase": {"target_runs": target, "revised": False},
+            },
+            "simulation": {"n_sims": 5000, "seed": None, "model": sim_model, "return_distributions": True},
+        }
+        try:
+            from cricket_companion.sim_schemas import SimulationRequest
+
+            SimulationRequest.model_validate(payload)
+            return payload
+        except Exception:
+            return None
+
+    return None
+
+
 def _extract_with_llm(state: ChatState, settings: Settings, *, kind: Literal["basic", "analyst"]) -> dict[str, Any] | None:
     """
     LLM-assisted parameter extraction only (not tool selection).
@@ -196,11 +353,29 @@ def plan_tools(state: ChatState, *, settings: Settings | None = None) -> ToolPla
         )
 
     if state.route == "sim":
+        payload = _try_extract_sim_request_from_text(state.user_message.content or "")
+        if payload is None:
+            return ToolPlan(
+                route="sim",
+                calls=[],
+                reason="Simulator route selected but scenario details could not be extracted deterministically.",
+                clarifying_question=(
+                    "Share a scenario like: `need 30 off 18 with 6 wickets in hand` or "
+                    "`chasing 168, at 78/3 in 10 overs` (or paste JSON matching the SimulationRequest schema)."
+                ),
+            )
         return ToolPlan(
             route="sim",
-            calls=[],
-            reason="Simulator is planned for Phase 3; no tools executed yet.",
-            clarifying_question="Simulator mode will be implemented later. Share the match situation (target/required, overs/balls left, wickets in hand) so we can use it once sim is added.",
+            calls=[
+                PlannedToolCall(
+                    tool_name="sim",
+                    args=payload,
+                    timeout_s=effective_settings.timeout_sim_s,
+                    use_cache=False,
+                    note="Monte Carlo scenario simulation (baseline)",
+                )
+            ],
+            reason="Sim route: run baseline Monte Carlo simulator.",
         )
 
     if state.route == "fantasy":
