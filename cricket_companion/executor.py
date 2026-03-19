@@ -8,7 +8,7 @@ from cricket_companion.chat_models import ChatState, ToolCallTrace
 from cricket_companion.output_models import TableArtifact
 from cricket_companion.planner import PlannedToolCall, ToolPlan
 from cricket_companion.schemas import Citation, ErrorCode, ToolError
-from cricket_companion.tools import RetrievalMcpClient, SimMcpClient, StatsMcpClient, WebMcpClient
+from cricket_companion.tools import FantasyMcpClient, RetrievalMcpClient, SimMcpClient, StatsMcpClient, WebMcpClient
 from cricket_companion.logging_config import get_logger
 from cricket_companion.config import get_settings
 
@@ -61,10 +61,11 @@ def execute_tool_plan_iter(state: ChatState) -> Any:
     retrieval_client: RetrievalMcpClient | None = None
     web_client: WebMcpClient | None = None
     sim_client: SimMcpClient | None = None
+    fantasy_client: FantasyMcpClient | None = None
     settings = get_settings()
 
     def _iter():
-        nonlocal stats_client, retrieval_client, web_client, sim_client
+        nonlocal stats_client, retrieval_client, web_client, sim_client, fantasy_client
         try:
             for call in plan.calls:
                 started_at = _utc_now()
@@ -151,7 +152,364 @@ def execute_tool_plan_iter(state: ChatState) -> Any:
                         resp = sim_client.run(call.args)
                         response_any = resp.model_dump(mode="json")
                     elif call.tool_name == "fantasy":
-                        tool_error = ToolError(code=ErrorCode.NOT_FOUND, message="fantasy not implemented yet.")
+                        # Best-effort news enrichment (3.3.3): if Tavily is configured, use web_search to infer
+                        # availability signals for players before optimizing.
+                        try:
+                            args_dict = call.args if isinstance(call.args, dict) else {}
+                            prefs = args_dict.get("preferences") if isinstance(args_dict.get("preferences"), dict) else {}
+                            use_news = prefs.get("use_news")
+                            if use_news is None:
+                                use_news = True
+
+                            if settings.tavily_api_key and bool(use_news):
+                                import re
+
+                                from cricket_companion.fantasy_news import (
+                                    apply_news_signal_to_player,
+                                    classify_news_text,
+                                )
+
+                                web_client = web_client or WebMcpClient()
+
+                                players = args_dict.get("players") if isinstance(args_dict.get("players"), list) else []
+                                teams = args_dict.get("teams") if isinstance(args_dict.get("teams"), list) else []
+                                # Keep injury/news searches cricket-focused to reduce false positives.
+                                include_domains = [
+                                    "espncricinfo.com",
+                                    "cricbuzz.com",
+                                    "iplt20.com",
+                                    "bcci.tv",
+                                    "thecricketer.com",
+                                ]
+
+                                def _looks_like_same_person(*, player_name: str, text: str) -> bool:
+                                    pn = (player_name or "").strip().lower()
+                                    t = (text or "").strip().lower()
+                                    if not pn or not t:
+                                        return False
+                                    if pn in t:
+                                        return True
+                                    toks = [x for x in re.split(r"\\s+", pn) if x]
+                                    if len(toks) >= 2:
+                                        return toks[0] in t and toks[-1] in t
+                                    return toks[0] in t
+
+                                # Team-level query (often contains playing XI + injury roundup).
+                                if len(teams) == 2 and all(isinstance(t, str) and t.strip() for t in teams):
+                                    q_team = f"{teams[0]} {teams[1]} playing XI injury update"
+                                    started2_at = _utc_now()
+                                    started2_perf = time.perf_counter()
+                                    yield {
+                                        "event": "tool_start",
+                                        "data": {
+                                            "tool_name": "web_search",
+                                            "request": {
+                                                "tool_name": "web_search",
+                                                "args": {
+                                                    "query": q_team,
+                                                    "top_k": 5,
+                                                    "topic": "news",
+                                                    "time_range": "week",
+                                                    "include_domains": include_domains,
+                                                },
+                                            },
+                                            "started_at": started2_at.isoformat(),
+                                        },
+                                    }
+                                    resp_team = web_client.search(
+                                        {
+                                            "query": q_team,
+                                            "top_k": 5,
+                                            "topic": "news",
+                                            "time_range": "week",
+                                            "search_depth": "basic",
+                                            "include_domains": include_domains,
+                                        }
+                                    )
+                                    resp_team_any = resp_team.model_dump(mode="json")
+                                    elapsed2_ms = int((time.perf_counter() - started2_perf) * 1000)
+                                    ended2_at = _utc_now()
+                                    citations2 = _extract_citations(resp_team_any)
+                                    cache2_hit, cache2_key = _extract_cache_info(resp_team_any)
+                                    trace2 = ToolCallTrace(
+                                        tool_name="web_search",
+                                        started_at=started2_at,
+                                        ended_at=ended2_at,
+                                        elapsed_ms=elapsed2_ms,
+                                        request={
+                                            "tool_name": "web_search",
+                                            "args": {
+                                                "query": q_team,
+                                                "top_k": 5,
+                                                "topic": "news",
+                                                "time_range": "week",
+                                                "include_domains": include_domains,
+                                            },
+                                        },
+                                        response=resp_team_any,
+                                        cache_hit=cache2_hit,
+                                        cache_key=cache2_key,
+                                        citations=citations2,
+                                        error=None,
+                                    )
+                                    state.tool_traces.append(trace2)
+                                    if citations2:
+                                        state.citations.extend(citations2)
+                                        yield {"event": "artifact_citations", "data": {"count": len(citations2)}}
+                                    yield {
+                                        "event": "tool_end",
+                                        "data": {"tool_name": "web_search", "ok": resp_team_any.get("ok"), "error": None, "elapsed_ms": elapsed2_ms, "ended_at": ended2_at.isoformat()},
+                                    }
+
+                                # Player-specific queries: limit to keep it cheap. Prefer unknown/doubtful players first.
+                                enriched_players: list[dict[str, Any]] = []
+                                candidates: list[dict[str, Any]] = []
+                                for p in players:
+                                    if not isinstance(p, dict):
+                                        continue
+                                    status = str(p.get("injury_status") or "unknown")
+                                    if status in {"unknown", "doubtful"}:
+                                        candidates.append(p)
+                                # If none, still consider top few by expected_points.
+                                if not candidates:
+                                    candidates = [p for p in players if isinstance(p, dict)]
+
+                                # rank: higher expected_points first
+                                def _pts(pp: dict[str, Any]) -> float:
+                                    v = pp.get("expected_points")
+                                    return float(v) if isinstance(v, (int, float)) else 0.0
+
+                                candidates = sorted(candidates, key=_pts, reverse=True)[:6]
+
+                                # Build a map for quick replacement.
+                                by_name: dict[str, dict[str, Any]] = {}
+                                for p in players:
+                                    if isinstance(p, dict) and isinstance(p.get("name"), str):
+                                        by_name[p["name"]] = p
+
+                                for p in candidates:
+                                    name = p.get("name")
+                                    if not isinstance(name, str) or not name.strip():
+                                        continue
+                                    q = f"{name} injury update availability"
+                                    started3_at = _utc_now()
+                                    started3_perf = time.perf_counter()
+                                    yield {
+                                        "event": "tool_start",
+                                        "data": {
+                                            "tool_name": "web_search",
+                                            "request": {
+                                                "tool_name": "web_search",
+                                                "args": {
+                                                    "query": q,
+                                                    "top_k": 3,
+                                                    "topic": "news",
+                                                    "time_range": "month",
+                                                    "include_domains": include_domains,
+                                                },
+                                            },
+                                            "started_at": started3_at.isoformat(),
+                                        },
+                                    }
+                                    resp_p = web_client.search(
+                                        {
+                                            "query": q,
+                                            "top_k": 3,
+                                            "topic": "news",
+                                            "time_range": "month",
+                                            "search_depth": "basic",
+                                            "include_domains": include_domains,
+                                        }
+                                    )
+                                    resp_p_any = resp_p.model_dump(mode="json")
+                                    elapsed3_ms = int((time.perf_counter() - started3_perf) * 1000)
+                                    ended3_at = _utc_now()
+                                    citations3 = _extract_citations(resp_p_any)
+                                    cache3_hit, cache3_key = _extract_cache_info(resp_p_any)
+                                    trace3 = ToolCallTrace(
+                                        tool_name="web_search",
+                                        started_at=started3_at,
+                                        ended_at=ended3_at,
+                                        elapsed_ms=elapsed3_ms,
+                                        request={
+                                            "tool_name": "web_search",
+                                            "args": {
+                                                "query": q,
+                                                "top_k": 3,
+                                                "topic": "news",
+                                                "time_range": "month",
+                                                "include_domains": include_domains,
+                                            },
+                                        },
+                                        response=resp_p_any,
+                                        cache_hit=cache3_hit,
+                                        cache_key=cache3_key,
+                                        citations=citations3,
+                                        error=None,
+                                    )
+                                    state.tool_traces.append(trace3)
+                                    if citations3:
+                                        state.citations.extend(citations3)
+                                        yield {"event": "artifact_citations", "data": {"count": len(citations3)}}
+                                    yield {
+                                        "event": "tool_end",
+                                        "data": {"tool_name": "web_search", "ok": resp_p_any.get("ok"), "error": None, "elapsed_ms": elapsed3_ms, "ended_at": ended3_at.isoformat()},
+                                    }
+
+                                    # Extract a signal from titles/snippets only (fast + deterministic).
+                                    data = resp_p_any.get("data") if isinstance(resp_p_any, dict) else None
+                                    results = data.get("results") if isinstance(data, dict) else None
+                                    signal = None
+                                    if isinstance(results, list):
+                                        for r in results[:3]:
+                                            if not isinstance(r, dict):
+                                                continue
+                                            txt = f"{r.get('title','')} {r.get('snippet','')}"
+                                            if not _looks_like_same_person(player_name=name, text=txt):
+                                                continue
+                                            sig = classify_news_text(txt)
+                                            if sig is not None:
+                                                signal = sig
+                                                break
+                                    if signal is not None:
+                                        updated, _ = apply_news_signal_to_player(by_name.get(name, p), signal)
+                                        by_name[name] = updated
+
+                                # Rebuild players list preserving original order where possible.
+                                for p in players:
+                                    if not isinstance(p, dict) or not isinstance(p.get("name"), str):
+                                        continue
+                                    enriched_players.append(by_name.get(p["name"], p))
+
+                                if enriched_players:
+                                    args_dict = dict(args_dict)
+                                    args_dict["players"] = enriched_players
+                                    call = PlannedToolCall(
+                                        tool_name=call.tool_name,
+                                        args=args_dict,
+                                        timeout_s=call.timeout_s,
+                                        use_cache=call.use_cache,
+                                        ttl_days=call.ttl_days,
+                                        note=call.note,
+                                    )
+                        except Exception:
+                            pass
+
+                        fantasy_client = fantasy_client or FantasyMcpClient()
+                        resp = fantasy_client.optimize(call.args if isinstance(call.args, dict) else {})
+                        response_any = resp.model_dump(mode="json")
+                        # 3.3.4 Alternatives: compute a couple of near-best lineups by excluding one player at a time.
+                        # This avoids changing the fantasy-mcp contract while still giving the UI multiple options.
+                        try:
+                            if (
+                                isinstance(response_any, dict)
+                                and bool(response_any.get("ok"))
+                                and isinstance(response_any.get("data"), dict)
+                                and isinstance(call.args, dict)
+                            ):
+                                primary_data = response_any["data"]
+                                selected = primary_data.get("selected_team") if isinstance(primary_data.get("selected_team"), list) else []
+                                base_prefs = call.args.get("preferences") if isinstance(call.args.get("preferences"), dict) else {}
+
+                                def _team_key(team_rows: list[dict[str, Any]]) -> tuple[str, ...]:
+                                    names = []
+                                    for r in team_rows:
+                                        if isinstance(r, dict) and isinstance(r.get("name"), str):
+                                            names.append(r["name"].strip().lower())
+                                    return tuple(sorted(n for n in names if n))
+
+                                primary_key = _team_key([r for r in selected if isinstance(r, dict)])
+                                seen_keys = {primary_key}
+                                alternatives: list[dict[str, Any]] = []
+
+                                # Pick a small set of exclusion candidates from the primary XI (prefer the lowest projected
+                                # players so the alternative stays close to best, and avoid must_include).
+                                must_include = base_prefs.get("must_include") if isinstance(base_prefs.get("must_include"), list) else []
+                                must_include_lc = {str(x).strip().lower() for x in must_include if isinstance(x, str)}
+                                must_exclude = base_prefs.get("must_exclude") if isinstance(base_prefs.get("must_exclude"), list) else []
+
+                                def _pt(row: dict[str, Any]) -> float:
+                                    v = row.get("expected_points")
+                                    return float(v) if isinstance(v, (int, float)) else 0.0
+
+                                xi_rows = [r for r in selected if isinstance(r, dict) and isinstance(r.get("name"), str)]
+                                xi_rows_sorted = sorted(xi_rows, key=_pt)  # lowest first
+                                exclude_candidates: list[str] = []
+                                for r in xi_rows_sorted:
+                                    nm = str(r.get("name") or "").strip()
+                                    if not nm:
+                                        continue
+                                    if nm.strip().lower() in must_include_lc:
+                                        continue
+                                    exclude_candidates.append(nm)
+                                    if len(exclude_candidates) >= 4:
+                                        break
+
+                                for nm in exclude_candidates:
+                                    if len(alternatives) >= 2:
+                                        break
+                                    # Build an alternative spec by excluding one player.
+                                    alt_spec = dict(call.args)
+                                    alt_prefs = dict(base_prefs)
+                                    alt_excl = [str(x) for x in must_exclude if isinstance(x, str)]
+                                    alt_excl.append(nm)
+                                    # Dedup while preserving order.
+                                    seen_ex: set[str] = set()
+                                    alt_prefs["must_exclude"] = [x for x in alt_excl if not (x.lower() in seen_ex or seen_ex.add(x.lower()))]
+                                    alt_spec["preferences"] = alt_prefs
+
+                                    started_alt = _utc_now()
+                                    started_alt_perf = time.perf_counter()
+                                    yield {
+                                        "event": "tool_start",
+                                        "data": {
+                                            "tool_name": "fantasy_alt",
+                                            "request": {"tool_name": "fantasy", "args": alt_spec, "note": f"Alternative XI (exclude {nm})"},
+                                            "started_at": started_alt.isoformat(),
+                                        },
+                                    }
+                                    alt_resp = fantasy_client.optimize(alt_spec)
+                                    alt_any = alt_resp.model_dump(mode="json")
+                                    elapsed_alt_ms = int((time.perf_counter() - started_alt_perf) * 1000)
+                                    ended_alt = _utc_now()
+                                    alt_trace = ToolCallTrace(
+                                        tool_name="fantasy_alt",
+                                        started_at=started_alt,
+                                        ended_at=ended_alt,
+                                        elapsed_ms=elapsed_alt_ms,
+                                        request={"tool_name": "fantasy", "args": alt_spec, "note": f"Alternative XI (exclude {nm})"},
+                                        response=alt_any,
+                                        cache_hit=None,
+                                        cache_key=None,
+                                        citations=[],
+                                        error=None,
+                                    )
+                                    state.tool_traces.append(alt_trace)
+                                    yield {
+                                        "event": "tool_end",
+                                        "data": {
+                                            "tool_name": "fantasy_alt",
+                                            "ok": (alt_any.get("ok") if isinstance(alt_any, dict) else None),
+                                            "error": None,
+                                            "elapsed_ms": elapsed_alt_ms,
+                                            "ended_at": ended_alt.isoformat(),
+                                        },
+                                    }
+
+                                    if not (isinstance(alt_any, dict) and bool(alt_any.get("ok")) and isinstance(alt_any.get("data"), dict)):
+                                        continue
+                                    alt_data = alt_any["data"]
+                                    alt_team = alt_data.get("selected_team") if isinstance(alt_data.get("selected_team"), list) else []
+                                    alt_key = _team_key([r for r in alt_team if isinstance(r, dict)])
+                                    if not alt_key or alt_key in seen_keys:
+                                        continue
+                                    seen_keys.add(alt_key)
+                                    alternatives.append(alt_data)
+
+                                if alternatives:
+                                    primary_data["alternatives"] = alternatives
+                        except Exception:
+                            pass
                     else:
                         tool_error = ToolError(code=ErrorCode.NOT_FOUND, message=f"Unknown planned tool: {call.tool_name}")
                 except Exception as exc:
@@ -307,6 +665,8 @@ def execute_tool_plan_iter(state: ChatState) -> Any:
                 web_client.close()
             if sim_client is not None:
                 sim_client.close()
+            if fantasy_client is not None:
+                fantasy_client.close()
 
     return _iter()
 

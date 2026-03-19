@@ -192,6 +192,48 @@ def compose_assistant_output(*, state: "ChatState", tool_plan: dict[str, Any] | 
 
         return build_sim_output(question=state.user_message.content, sim_tool_response=resp or {}, request_id=state.request_id)
 
+    if state.route == "fantasy":
+        from cricket_companion.fantasy_response import build_fantasy_output
+        from cricket_companion.output_models import AssistantOutput
+
+        fantasy_trace = next((t for t in reversed(state.tool_traces) if t.tool_name == "fantasy"), None)
+        if fantasy_trace is None:
+            return AssistantOutput(
+                answer_text="I couldn't run the fantasy optimizer for this question. Please try again.",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["Missing fantasy tool trace."],
+            )
+        if fantasy_trace.error is not None:
+            return AssistantOutput(
+                answer_text=f"Fantasy tool error: {fantasy_trace.error.code}: {fantasy_trace.error.message}",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["Fantasy tool execution failed before returning output."],
+            )
+
+        resp = fantasy_trace.response if isinstance(fantasy_trace.response, dict) else None
+        ok = bool(resp.get("ok")) if resp is not None else False
+        if not ok:
+            err = (resp or {}).get("error") or {}
+            code = err.get("code") or "UNKNOWN"
+            msg = err.get("message") or "Fantasy optimization failed."
+            return AssistantOutput(
+                answer_text=f"Couldn't build a fantasy XI ({code}): {msg}",
+                citations=[],
+                tables=[],
+                charts=[],
+                warnings=["No fantasy answer was composed because fantasy returned ok=false."],
+            )
+
+        return build_fantasy_output(
+            question=state.user_message.content,
+            fantasy_tool_response=resp or {},
+            request_id=state.request_id,
+        )
+
     call_lines = []
     for call in calls:
         call_lines.append(f"- {call.get('tool_name')} args={call.get('args')}")

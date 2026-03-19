@@ -211,6 +211,20 @@ def _try_extract_sim_request_from_text(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _try_extract_fantasy_request_from_text(text: str) -> dict[str, Any] | None:
+    raw = _strip_code_fences(text)
+    if raw.startswith("{") and raw.endswith("}"):
+        try:
+            payload = json.loads(raw)
+            from cricket_companion.fantasy_schemas import FantasyRequest
+
+            FantasyRequest.model_validate(payload)
+            return payload
+        except Exception:
+            return None
+    return None
+
+
 def _extract_with_llm(state: ChatState, settings: Settings, *, kind: Literal["basic", "analyst"]) -> dict[str, Any] | None:
     """
     LLM-assisted parameter extraction only (not tool selection).
@@ -379,11 +393,29 @@ def plan_tools(state: ChatState, *, settings: Settings | None = None) -> ToolPla
         )
 
     if state.route == "fantasy":
+        payload = _try_extract_fantasy_request_from_text(state.user_message.content or "")
+        if payload is None:
+            return ToolPlan(
+                route="fantasy",
+                calls=[],
+                reason="Fantasy route selected but rules/player pool JSON was not provided.",
+                clarifying_question=(
+                    "Paste a JSON payload matching the FantasyRequest schema (rules + teams + players). "
+                    "You can generate an example with: `python tests/manual_fantasy_schema_test.py`."
+                ),
+            )
         return ToolPlan(
             route="fantasy",
-            calls=[],
-            reason="Fantasy assistant is planned for Phase 3; no tools executed yet.",
-            clarifying_question="Fantasy mode will be implemented later. Which match/teams is this for, and what fantasy rules do you want (platform, credits/budget, roles, team limits)?",
+            calls=[
+                PlannedToolCall(
+                    tool_name="fantasy",
+                    args=payload,
+                    timeout_s=effective_settings.timeout_fantasy_s,
+                    use_cache=False,
+                    note="Fantasy XI optimizer (baseline constraints)",
+                )
+            ],
+            reason="Fantasy route: run optimizer over provided player pool.",
         )
 
     return ToolPlan(route="unknown", calls=[], reason="Unhandled route.", clarifying_question=state.clarifying_question)

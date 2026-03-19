@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 from datetime import UTC, datetime
 from typing import Any, Iterator, Tuple
@@ -415,7 +416,7 @@ def main() -> None:
 
         st.caption("Tip: you can send `/pref ...` and `/mem ...` commands in chat.")
 
-    tabs = st.tabs(["Chat", "Simulator"])
+    tabs = st.tabs(["Chat", "Simulator", "Fantasy"])
 
     with tabs[0]:
         col_chat, col_details = st.columns([3, 1], gap="large")
@@ -555,6 +556,208 @@ def main() -> None:
         last_result = st.session_state.get("sim_last_result")
         if not last_text:
             st.info("Run a scenario to see results here.")
+        else:
+            st.markdown(last_text)
+            if isinstance(last_result, dict):
+                st.divider()
+                _render_result_payload(last_result)
+
+    with tabs[2]:
+        st.subheader("Fantasy Draft Assistant")
+        st.caption("Upload a player pool + rules, then run the fantasy optimizer (with optional news enrichment).")
+
+        st.session_state.setdefault("fantasy_last_result", None)
+        st.session_state.setdefault("fantasy_last_text", None)
+        st.session_state.setdefault("fantasy_last_request_id", None)
+
+        def _csv_to_players(df: pd.DataFrame) -> list[dict[str, Any]]:
+            cols = {c.lower().strip(): c for c in df.columns}
+            req = ["name", "team", "role", "credits"]
+            missing = [c for c in req if c not in cols]
+            if missing:
+                raise ValueError(f"CSV missing required columns: {missing}. Required: {req}")
+
+            out: list[dict[str, Any]] = []
+            for _, row in df.iterrows():
+                name = str(row[cols["name"]] or "").strip()
+                team = str(row[cols["team"]] or "").strip()
+                role = str(row[cols["role"]] or "").strip().lower()
+                credits_raw = row[cols["credits"]]
+                if not name or not team or not role:
+                    continue
+                try:
+                    credits = float(credits_raw)
+                except Exception:
+                    continue
+                p: dict[str, Any] = {"name": name, "team": team, "role": role, "credits": credits}
+                if "expected_points" in cols:
+                    try:
+                        p["expected_points"] = float(row[cols["expected_points"]])
+                    except Exception:
+                        pass
+                if "is_probable_xi" in cols:
+                    v = str(row[cols["is_probable_xi"]]).strip().lower()
+                    if v in {"true", "1", "yes", "y"}:
+                        p["is_probable_xi"] = True
+                    elif v in {"false", "0", "no", "n"}:
+                        p["is_probable_xi"] = False
+                if "injury_status" in cols:
+                    p["injury_status"] = str(row[cols["injury_status"]] or "").strip().lower() or "unknown"
+                out.append(p)
+            return out
+
+        with st.form("fantasy_form", clear_on_submit=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                input_mode = st.radio("Input mode", ["Paste JSON", "Upload CSV"], horizontal=True)
+                platform = st.selectbox("Platform", ["generic", "dream11", "my11circle"], index=0)
+                fmt = st.selectbox("Format", ["IPL", "T20", "ODI", "TEST"], index=0)
+                team_count = st.number_input("Team size", min_value=1, max_value=15, value=11)
+                budget = st.number_input("Budget", min_value=1.0, max_value=500.0, value=100.0, step=0.5)
+                max_from_one_team = st.number_input("Max from one team", min_value=1, max_value=11, value=7)
+            with c2:
+                use_news = st.checkbox("Use news (injury/availability)", value=True)
+                risk_profile = st.selectbox("Risk profile", ["safe", "balanced", "high_variance"], index=1)
+                must_include_txt = st.text_input("Must include (comma-separated)", value="")
+                must_exclude_txt = st.text_input("Must exclude (comma-separated)", value="")
+
+            with st.expander("Role constraints", expanded=False):
+                r1, r2 = st.columns(2)
+                with r1:
+                    wk_min = st.number_input("WK min", min_value=0, max_value=11, value=1)
+                    bat_min = st.number_input("BAT min", min_value=0, max_value=11, value=3)
+                    ar_min = st.number_input("AR min", min_value=0, max_value=11, value=1)
+                    bowl_min = st.number_input("BOWL min", min_value=0, max_value=11, value=3)
+                with r2:
+                    wk_max = st.number_input("WK max", min_value=0, max_value=11, value=4)
+                    bat_max = st.number_input("BAT max", min_value=0, max_value=11, value=6)
+                    ar_max = st.number_input("AR max", min_value=0, max_value=11, value=4)
+                    bowl_max = st.number_input("BOWL max", min_value=0, max_value=11, value=6)
+
+            json_text = ""
+            upload = None
+            team_a_sel: str | None = None
+            team_b_sel: str | None = None
+            if input_mode == "Paste JSON":
+                json_text = st.text_area("FantasyRequest JSON", value="", height=220, placeholder="Paste a full FantasyRequest JSON here.")
+            else:
+                upload = st.file_uploader("Player pool CSV", type=["csv"])
+                st.caption("CSV required columns: name, team, role, credits. Optional: expected_points, is_probable_xi, injury_status.")
+                if upload is not None:
+                    try:
+                        df_preview = pd.read_csv(io.BytesIO(upload.getvalue()))
+                        players_preview = _csv_to_players(df_preview)
+                        teams_preview = sorted({p["team"] for p in players_preview if isinstance(p.get("team"), str) and p["team"].strip()})
+                        if len(teams_preview) >= 2:
+                            team_a_sel = st.selectbox("Team A", teams_preview, index=0)
+                            team_b_opts = [t for t in teams_preview if t != team_a_sel]
+                            team_b_sel = st.selectbox("Team B", team_b_opts, index=0)
+                    except Exception as exc:
+                        st.warning(f"Couldn't preview teams from CSV yet: {exc}")
+
+            also_chat = st.checkbox("Also add to chat history", value=True)
+            submitted = st.form_submit_button("Run fantasy optimizer")
+
+        if submitted:
+            try:
+                if input_mode == "Paste JSON":
+                    if not json_text.strip():
+                        raise ValueError("Paste a FantasyRequest JSON payload (or switch to Upload CSV).")
+                    payload = json.loads(json_text)
+                else:
+                    if upload is None:
+                        raise ValueError("Upload a CSV file (or switch to Paste JSON).")
+                    df = pd.read_csv(io.BytesIO(upload.getvalue()))
+                    players = _csv_to_players(df)
+                    if not players:
+                        raise ValueError("No valid players parsed from CSV.")
+                    teams = sorted({p["team"] for p in players if isinstance(p.get("team"), str) and p["team"].strip()})
+                    if len(teams) < 2:
+                        raise ValueError("CSV must contain at least 2 distinct teams.")
+                    team_a = team_a_sel or teams[0]
+                    team_b = team_b_sel or (teams[1] if teams[1] != team_a else teams[0])
+                    if team_a == team_b:
+                        # Last-resort fallback.
+                        team_a = teams[0]
+                        team_b = next((t for t in teams if t != team_a), teams[1])
+                    payload = {
+                        "rules": {
+                            "platform": platform,
+                            "format": fmt,
+                            "team_count": int(team_count),
+                            "budget": float(budget),
+                            "max_from_one_team": int(max_from_one_team),
+                            "roles": {
+                                "wk": {"min": int(wk_min), "max": int(wk_max)},
+                                "bat": {"min": int(bat_min), "max": int(bat_max)},
+                                "ar": {"min": int(ar_min), "max": int(ar_max)},
+                                "bowl": {"min": int(bowl_min), "max": int(bowl_max)},
+                            },
+                            "captain": {"captain_multiplier": 2.0, "vice_captain_multiplier": 1.5},
+                        },
+                        "teams": [team_a, team_b],
+                        "players": players,
+                        "preferences": {},
+                    }
+
+                def _split_csv(s: str) -> list[str]:
+                    return [x.strip() for x in (s or "").split(",") if x.strip()]
+
+                prefs = payload.get("preferences") if isinstance(payload.get("preferences"), dict) else {}
+                prefs["risk_profile"] = risk_profile
+                prefs["use_news"] = bool(use_news)
+                prefs["must_include"] = _split_csv(must_include_txt)
+                prefs["must_exclude"] = _split_csv(must_exclude_txt)
+                payload["preferences"] = prefs
+
+                # Validate locally if possible.
+                try:
+                    from cricket_companion.fantasy_schemas import FantasyRequest
+
+                    FantasyRequest.model_validate(payload)
+                except Exception as exc:
+                    st.warning(f"Local validation warning (still sending to API): {exc}")
+
+                request_id = f"ui-fantasy-{uuid4()}"
+                msg_id = f"ui-msg-{uuid4()}"
+                user_text = json.dumps(payload, ensure_ascii=False)
+
+                if also_chat:
+                    _append_message("user", f"fantasy (payload)\n\n```json\n{user_text}\n```", request_id=request_id)
+
+                with st.chat_message("assistant"):
+                    placeholder = st.empty()
+
+                assembled, result_payload, debug_events = _stream_turn(
+                    user_text=user_text,
+                    request_id=request_id,
+                    msg_id=msg_id,
+                    placeholder=placeholder,
+                    metadata={"force_route": "fantasy", "ui_mode": "fantasy"},
+                )
+
+                st.session_state["fantasy_last_text"] = assembled
+                st.session_state["fantasy_last_result"] = result_payload
+                st.session_state["fantasy_last_request_id"] = request_id
+
+                if also_chat:
+                    _append_message(
+                        "assistant",
+                        assembled,
+                        request_id=request_id,
+                        result=result_payload,
+                        debug_events=debug_events if bool(st.session_state.get("debug")) else None,
+                    )
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+        st.divider()
+        st.subheader("Last fantasy run")
+        last_text = st.session_state.get("fantasy_last_text")
+        last_result = st.session_state.get("fantasy_last_result")
+        if not last_text:
+            st.info("Run the fantasy optimizer to see results here.")
         else:
             st.markdown(last_text)
             if isinstance(last_result, dict):

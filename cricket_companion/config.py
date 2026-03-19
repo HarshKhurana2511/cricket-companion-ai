@@ -140,7 +140,8 @@ def get_settings(*, load_env_file: bool = True) -> Settings:
         env=env,
         model=_getenv("MODEL", "gpt-4o-mini") or "gpt-4o-mini",
         openai_api_key=_getenv("OPENAI_API_KEY"),
-        tavily_api_key=_getenv("TAVILY_API_KEY"),
+        # Project convention uses CC_TAVILY_API_KEY; fall back to Tavily's default env var name.
+        tavily_api_key=_getenv("CC_TAVILY_API_KEY") or _getenv("TAVILY_API_KEY"),
         aws_region=_getenv("AWS_REGION", "us-east-1") or "us-east-1",
         s3_bucket=_getenv("S3_BUCKET"),
         s3_prefix=_getenv("S3_PREFIX", "cricket-companion") or "cricket-companion",
